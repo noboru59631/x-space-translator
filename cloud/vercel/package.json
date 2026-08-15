@@ -1,0 +1,13 @@
+{
+  "name": "x-space-translator-vercel-poc",
+  "private": true,
+  "version": "0.1.0-poc",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
+}
