@@ -1,0 +1,90 @@
+# X Space Translator Render Bridge PoC
+
+This isolated service downloads an X Space, copies its AAC audio into a valid
+M4A container, validates it with ffprobe, and streams the file to Groq Whisper.
+It does not install faster-whisper, M2M100, PyTorch, Transformers, or any model
+weights.
+
+## Flow
+
+1. Accept an allowlisted X Space or broadcast URL.
+2. Download to a random job directory with yt-dlp and no cookies.
+3. Remux the first audio stream with system FFmpeg and `-c:a copy`.
+4. Validate file existence, size, positive duration, container, and AAC codec.
+5. Stream the M4A file to Groq `whisper-large-v3-turbo`.
+6. Return Bankr Viewer-compatible English transcript JSON.
+7. Delete the complete job directory in a `finally` block.
+
+The service does not re-encode audio. If stream copy cannot produce a valid
+AAC/M4A file, the job fails before contacting Groq.
+
+## API
+
+`GET /health` is public and returns only dependency availability.
+
+The following endpoints require
+`Authorization: Bearer <BRIDGE_API_KEY>`:
+
+- `POST /jobs`
+- `POST /transcribe` (job-creation alias)
+- `GET /jobs/{job_id}`
+- `GET /jobs/{job_id}/result`
+
+Example request:
+
+```json
+{"url": "https://x.com/i/spaces/1qxvvvQBRXQxB/peek"}
+```
+
+Both POST endpoints return HTTP 202 with a random `job_id`. Poll the status
+endpoint until it reaches `completed`, then read the result endpoint. A second
+submission while one job is active receives HTTP 429.
+
+Jobs and results are held only in memory. They disappear on a Render restart,
+deploy, or free-instance spin-down. This is a PoC limitation.
+
+## Local Docker
+
+Build from the repository root:
+
+```text
+docker build -f cloud/render-bridge/Dockerfile \
+  -t x-space-translator-render-bridge:poc .
+```
+
+Run with secrets supplied only at runtime:
+
+```text
+docker run --rm -p 10000:10000 \
+  -e BRIDGE_API_KEY=<random-secret> \
+  -e GROQ_API_KEY=<groq-secret> \
+  x-space-translator-render-bridge:poc
+```
+
+## Groq limit
+
+Groq's current free-tier speech-to-text upload limit is 25 MB. The bridge
+enforces that limit after remuxing and before upload. It does not fall back to
+lossy re-encoding or chunking in this PoC.
+
+Audio is sent to Groq for transcription. The bridge does not persist audio or
+transcripts, but users must account for Groq's own data handling terms.
+
+## Render Free
+
+The included `render.yaml` explicitly requests a Free Web Service, uses
+`/health`, generates `BRIDGE_API_KEY`, and prompts for `GROQ_API_KEY`
+without committing either value.
+
+Create a Blueprint from this repository and select
+`cloud/render-bridge/render.yaml` if Render does not use the root default.
+Review that the selected plan is **Free** before creating the service.
+
+Current Render documentation lists Free Web Services at 512 MB RAM and 0.1 CPU,
+and states that they spin down after 15 minutes without inbound traffic. The
+first request after sleep therefore includes cold-start delay. No persistent
+disk is used.
+
+Deployment requires this directory to exist in the Git commit visible to
+Render. Do not deploy from the older public commit, because it does not contain
+the bridge.

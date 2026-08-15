@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: x-space-translator-bridge
+    runtime: docker
+    plan: free
+    dockerfilePath: ./cloud/render-bridge/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: "off"
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - key: BRIDGE_API_KEY
+        generateValue: true
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MAX_UPLOAD_MB
+        value: "25"
+      - key: RESULT_TTL_SECONDS
+        value: "3600"

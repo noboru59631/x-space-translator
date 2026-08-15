@@ -1,0 +1,8 @@
+**
+!app/__init__.py
+!app/services/__init__.py
+!app/services/downloader.py
+!app/services/errors.py
+!cloud/render-bridge/requirements.txt
+!cloud/render-bridge/render_bridge_app/
+!cloud/render-bridge/render_bridge_app/**

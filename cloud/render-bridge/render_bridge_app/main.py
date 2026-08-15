@@ -1,0 +1,416 @@
+"""FastAPI job service for X Space media acquisition and Groq transcription."""
+
+from __future__ import annotations
+
+import hmac
+import importlib.util
+import logging
+import os
+import shutil
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Annotated
+
+import psutil
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+from app.services.downloader import download_space, normalize_x_url
+from app.services.errors import AppError, DownloadError
+from render_bridge_app.errors import BridgeError
+from render_bridge_app.groq_client import transcribe_m4a
+from render_bridge_app.media import dependencies_available, probe_m4a, remux_to_m4a
+
+LOGGER = logging.getLogger(__name__)
+WORK_ROOT = Path(
+    os.getenv("BRIDGE_TEMP_DIR", "/tmp/x-space-translator-render-bridge")
+)
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
+MAX_JSON_BODY_BYTES = 8192
+RESULT_TTL_SECONDS = max(60, int(os.getenv("RESULT_TTL_SECONDS", "3600")))
+GROQ_FREE_MAX_MB = 25
+
+
+class BusyError(RuntimeError):
+    """Only one download/transcription job can run on a free instance."""
+
+
+class TranscribeRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        try:
+            return normalize_x_url(value)
+        except AppError as exc:
+            raise ValueError(str(exc)) from exc
+
+
+def groq_upload_limit_bytes() -> int:
+    requested = max(1, int(os.getenv("GROQ_MAX_UPLOAD_MB", "25")))
+    return min(GROQ_FREE_MAX_MB, requested) * 1024 * 1024
+
+
+class JobManager:
+    """Single-worker, in-memory PoC job manager."""
+
+    def __init__(self) -> None:
+        self.jobs: dict[str, dict[str, object]] = {}
+        self.lock = threading.Lock()
+        self.active_job_id: str | None = None
+        self.executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="render-bridge",
+        )
+
+    def is_busy(self) -> bool:
+        with self.lock:
+            return self.active_job_id is not None
+
+    def submit(self, source_url: str) -> dict[str, object]:
+        job = self._reserve(source_url)
+        try:
+            self.executor.submit(self._run, str(job["job_id"]), source_url)
+        except Exception:
+            self._abandon(str(job["job_id"]))
+            raise
+        return self.status_view(job)
+
+    def get(self, job_id: str) -> dict[str, object] | None:
+        self._expire()
+        with self.lock:
+            job = self.jobs.get(job_id)
+            return dict(job) if job else None
+
+    @staticmethod
+    def status_view(job: dict[str, object]) -> dict[str, object]:
+        fields = (
+            "job_id",
+            "status",
+            "stage",
+            "progress",
+            "error_code",
+            "error",
+            "media_duration",
+            "media_size_bytes",
+            "media_codec",
+            "download_seconds",
+            "remux_seconds",
+            "groq_seconds",
+            "elapsed_seconds",
+            "peak_memory_mb",
+            "cleanup",
+        )
+        return {field: job.get(field) for field in fields}
+
+    @classmethod
+    def result_view(cls, job: dict[str, object]) -> dict[str, object]:
+        result = job.get("result")
+        if job.get("status") == "completed" and isinstance(result, dict):
+            return dict(result)
+        return cls.status_view(job)
+
+    def _reserve(self, source_url: str) -> dict[str, object]:
+        job_id = uuid.uuid4().hex
+        job: dict[str, object] = {
+            "job_id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "source_url": source_url,
+            "created_at": time.time(),
+            "error_code": None,
+            "error": None,
+            "media_duration": None,
+            "media_size_bytes": None,
+            "media_codec": None,
+            "download_seconds": None,
+            "remux_seconds": None,
+            "groq_seconds": None,
+            "elapsed_seconds": None,
+            "peak_memory_mb": None,
+            "cleanup": False,
+            "result": None,
+        }
+        with self.lock:
+            if self.active_job_id is not None:
+                raise BusyError("Bridge is already processing another job")
+            self.active_job_id = job_id
+            self.jobs[job_id] = job
+        return job
+
+    def _update(self, job_id: str, **values: object) -> None:
+        with self.lock:
+            if job_id in self.jobs:
+                self.jobs[job_id].update(values)
+
+    def _abandon(self, job_id: str) -> None:
+        with self.lock:
+            self.jobs.pop(job_id, None)
+            if self.active_job_id == job_id:
+                self.active_job_id = None
+
+    def _finish(self, job_id: str) -> None:
+        with self.lock:
+            if self.active_job_id == job_id:
+                self.active_job_id = None
+
+    def _run(self, job_id: str, source_url: str) -> None:
+        job_dir = WORK_ROOT / job_id
+        started = time.perf_counter()
+        stop_sampling, peak = self._start_memory_sampler()
+        result: dict[str, object] | None = None
+        failure: tuple[str, str] | None = None
+        try:
+            job_dir.mkdir(parents=True, exist_ok=False)
+            download_started = time.perf_counter()
+            self._update(
+                job_id,
+                status="processing",
+                stage="downloading",
+                progress=10,
+            )
+            source, metadata = download_space(source_url, job_dir)
+            self._update(
+                job_id,
+                download_seconds=round(time.perf_counter() - download_started, 3),
+            )
+
+            remux_started = time.perf_counter()
+            self._update(job_id, stage="validating", progress=35)
+            m4a_path = remux_to_m4a(source, job_dir / "groq-upload.m4a")
+            media = probe_m4a(m4a_path)
+            self._update(
+                job_id,
+                media_duration=round(media.duration, 3),
+                media_size_bytes=media.size_bytes,
+                media_codec=media.codec,
+                remux_seconds=round(time.perf_counter() - remux_started, 3),
+                progress=55,
+            )
+            if media.size_bytes > groq_upload_limit_bytes():
+                raise BridgeError(
+                    "GROQ_FILE_TOO_LARGE",
+                    "The validated M4A exceeds the Groq Free Tier 25 MB limit",
+                )
+
+            groq_started = time.perf_counter()
+            self._update(job_id, stage="transcribing", progress=65)
+            transcript = transcribe_m4a(
+                m4a_path,
+                os.environ["GROQ_API_KEY"],
+            )
+            self._update(
+                job_id,
+                groq_seconds=round(time.perf_counter() - groq_started, 3),
+                progress=95,
+            )
+            result = {
+                "title": str(metadata.get("title") or ""),
+                "source_url": source_url,
+                "detected_language": transcript["detected_language"],
+                "duration": transcript["duration"] or round(media.duration, 3),
+                "segments": transcript["segments"],
+            }
+        except DownloadError as exc:
+            failure = (classify_download_failure(exc), str(exc))
+        except BridgeError as exc:
+            failure = (exc.code, str(exc))
+        except Exception:
+            LOGGER.exception("Unexpected render bridge job failure: %s", job_id)
+            failure = ("CODE_ERROR", "Unexpected bridge error")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            stop_sampling.set()
+            common = {
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+                "peak_memory_mb": round(peak[0], 1),
+                "cleanup": not job_dir.exists(),
+                "progress": 100,
+            }
+            if result is not None:
+                self._update(
+                    job_id,
+                    **common,
+                    status="completed",
+                    stage="completed",
+                    result=result,
+                )
+            else:
+                code, message = failure or ("CODE_ERROR", "Unexpected bridge error")
+                self._update(
+                    job_id,
+                    **common,
+                    status="failed",
+                    stage="failed",
+                    error_code=code,
+                    error=message,
+                )
+            self._finish(job_id)
+
+    @staticmethod
+    def _start_memory_sampler() -> tuple[threading.Event, list[float]]:
+        stopped = threading.Event()
+        process = psutil.Process()
+        peak = [process.memory_info().rss / 1024 / 1024]
+
+        def sample() -> None:
+            while not stopped.wait(0.25):
+                try:
+                    rss = process.memory_info().rss
+                    rss += sum(
+                        child.memory_info().rss
+                        for child in process.children(recursive=True)
+                    )
+                    peak[0] = max(peak[0], rss / 1024 / 1024)
+                except (OSError, psutil.Error):
+                    pass
+
+        threading.Thread(
+            target=sample,
+            daemon=True,
+            name="render-bridge-memory",
+        ).start()
+        return stopped, peak
+
+    def _expire(self) -> None:
+        cutoff = time.time() - RESULT_TTL_SECONDS
+        with self.lock:
+            expired = [
+                job_id
+                for job_id, job in self.jobs.items()
+                if float(job["created_at"]) < cutoff
+                and job["status"] not in {"queued", "processing"}
+            ]
+            for job_id in expired:
+                self.jobs.pop(job_id, None)
+
+
+def classify_download_failure(exc: BaseException) -> str:
+    details = " ".join(str(item) for item in (exc, exc.__cause__) if item).lower()
+    if any(marker in details for marker in ("sign in", "login", "cookie", "auth")):
+        return "AUTH_REQUIRED"
+    if any(marker in details for marker in ("403", "429", "forbidden", "blocked")):
+        return "BLOCKED"
+    if any(marker in details for marker in ("extractor", "unsupported url")):
+        return "EXTRACTOR_ERROR"
+    if any(
+        marker in details
+        for marker in ("timeout", "timed out", "dns", "connection", "network")
+    ):
+        return "NETWORK_ERROR"
+    return "DOWNLOAD_ERROR"
+
+
+manager = JobManager()
+app = FastAPI(title="X Space Translator Render Bridge PoC", version="0.1.0-poc")
+
+
+@app.middleware("http")
+async def limit_json_body(request: Request, call_next):  # type: ignore[no-untyped-def]
+    if request.method == "POST" and request.url.path in {"/jobs", "/transcribe"}:
+        content_length = request.headers.get("content-length")
+        try:
+            declared_length = int(content_length) if content_length else 0
+        except ValueError:
+            return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
+        if declared_length > MAX_JSON_BODY_BYTES:
+            return JSONResponse(
+                {"detail": "Request body too large"},
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+        if len(await request.body()) > MAX_JSON_BODY_BYTES:
+            return JSONResponse(
+                {"detail": "Request body too large"},
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+    return await call_next(request)
+
+
+def require_bridge_key(
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    expected = os.getenv("BRIDGE_API_KEY", "")
+    if not expected:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "BRIDGE_API_KEY is not configured",
+        )
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(token, expected):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Invalid or missing Bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def submit_job(payload: TranscribeRequest) -> dict[str, object]:
+    if not os.getenv("GROQ_API_KEY"):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "GROQ_API_KEY is not configured",
+        )
+    try:
+        return manager.submit(payload.url)
+    except BusyError as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"service": "x-space-translator-render-bridge", "status": "ok"}
+
+
+@app.get("/health")
+def health() -> dict[str, object]:
+    ffmpeg, ffprobe = dependencies_available()
+    return {
+        "status": "ok",
+        "ffmpeg": ffmpeg and ffprobe,
+        "yt_dlp": importlib.util.find_spec("yt_dlp") is not None,
+    }
+
+
+@app.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
+def create_job(
+    payload: TranscribeRequest,
+    _: Annotated[None, Depends(require_bridge_key)],
+) -> dict[str, object]:
+    return submit_job(payload)
+
+
+@app.post("/transcribe", status_code=status.HTTP_202_ACCEPTED)
+def transcribe(
+    payload: TranscribeRequest,
+    _: Annotated[None, Depends(require_bridge_key)],
+) -> dict[str, object]:
+    return submit_job(payload)
+
+
+def find_job(job_id: str) -> dict[str, object]:
+    job = manager.get(job_id)
+    if not job:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
+    return job
+
+
+@app.get("/jobs/{job_id}")
+def get_job(
+    job_id: str,
+    _: Annotated[None, Depends(require_bridge_key)],
+) -> dict[str, object]:
+    return manager.status_view(find_job(job_id))
+
+
+@app.get("/jobs/{job_id}/result")
+def get_result(
+    job_id: str,
+    _: Annotated[None, Depends(require_bridge_key)],
+) -> dict[str, object]:
+    return manager.result_view(find_job(job_id))
