@@ -1,0 +1,4 @@
+-r requirements.txt
+# Optional speaker diarization. Install after matching PyTorch to your CUDA version.
+pyannote.audio>=3.3,<4
+whisperx>=3.3,<4

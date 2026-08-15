@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X Space Translator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand"><span class="brand-mark">X</span><div><h1>Space Translator</h1><p>X Spacesを英語と日本語で読む</p></div></div>
+      <div id="health" class="health">環境を確認中…</div>
+    </header>
+
+    <section class="notice">音声処理は原則として利用者ご自身のPC上で実行されます。文字起こし・翻訳する権利または許可のあるコンテンツだけを利用してください。</section>
+
+    <section class="card input-card">
+      <div class="tabs"><button class="tab active" data-tab="url">Space URL</button><button class="tab" data-tab="file">音声ファイル</button></div>
+      <form id="url-form" class="source-panel active">
+        <label for="space-url">X Space URL</label>
+        <div class="input-row"><input id="space-url" type="url" placeholder="https://x.com/i/broadcasts/…" required><button type="submit" class="primary">文字起こし開始</button></div>
+        <p class="hint">X側の仕様やアクセス制限により取得できない場合は、音声ファイルをアップロードできます。</p>
+      </form>
+      <form id="file-form" class="source-panel">
+        <label class="drop-zone" for="audio-file"><strong>音声・動画ファイルを選択</strong><span>MP3 / WAV / M4A / MP4 / WEBM</span><input id="audio-file" type="file" accept=".mp3,.wav,.m4a,.mp4,.webm,audio/*,video/mp4,video/webm" required></label>
+        <button type="submit" class="primary">アップロードして文字起こし</button>
+      </form>
+      <div class="settings">
+        <label>処理モード<select id="mode"><option value="light">軽量</option><option value="standard" selected>標準</option><option value="accurate">高精度</option></select></label>
+        <label class="check"><input id="diarize" type="checkbox"><span>話者分離（HF_TOKENが必要）</span></label>
+      </div>
+    </section>
+
+    <section id="progress-card" class="card hidden" aria-live="polite">
+      <div class="progress-head"><div><strong id="stage">準備中</strong><span id="progress-number">0%</span></div><button id="cancel" class="ghost">キャンセル</button></div>
+      <div class="progress-track"><div id="progress-bar"></div></div>
+      <p id="error" class="error hidden"></p>
+    </section>
+
+    <section id="result-card" class="card hidden">
+      <div class="result-head"><div><span class="eyebrow">TRANSCRIPT</span><h2 id="result-title">文字起こし結果</h2><p id="meta"></p></div><button id="translate" class="secondary">日本語に翻訳</button></div>
+      <div class="toolbar">
+        <div class="segmented"><button data-display="en" class="active">English</button><button data-display="ja">日本語</button><button data-display="both">EN + JA</button></div>
+        <div class="exports"><button data-format="txt">TXT</button><button data-format="srt">SRT</button><button data-format="vtt">VTT</button><button data-format="json">JSON</button><button id="copy">コピー</button></div>
+      </div>
+      <div id="speaker-editor" class="speaker-editor"></div>
+      <div id="segments" class="segments"></div>
+    </section>
+  </main>
+  <footer>Runs locally on your PC · No paid transcription API required</footer>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
