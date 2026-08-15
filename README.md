@@ -1,12 +1,26 @@
 # X Space Translator
 
+## 🪟 Windowsユーザー：まずここから
+
+プログラミングの知識は必要ありません。
+
+1. **[Windows版をダウンロード](https://github.com/noboru59631/x-space-translator/releases/download/v0.1.3-beta/X-Space-Translator-Windows-v0.1.3-beta.zip)**
+2. ZIPを右クリックして「すべて展開」
+3. `setup.bat`をダブルクリック（初回のみ）
+4. `start.bat`をダブルクリック
+5. ブラウザでX Space URLを貼り付け
+
+GitHubが自動生成する「Source code (zip)」ではなく、上の専用Windows版ZIPを利用してください。
+
 Paste an X Space URL and read the conversation in English and Japanese.
 
 Runs locally on your PC. No paid transcription API required.
 
 **Status:** Beta
 
-**Current release:** `v0.1.0-beta`
+**Current release:** `v0.1.2-beta`
+
+**Next Windows package candidate:** `v0.1.3-beta`
 
 X Space Translator downloads an available X Space audio stream—or accepts a local audio/video file—then converts, transcribes, optionally separates speakers, translates to Japanese, and exports the result. The FastAPI interface is intentionally bound to `127.0.0.1` by default.
 
@@ -61,7 +75,7 @@ Screenshots are intentionally not fabricated. Add verified application screensho
 
 ## Quick Start (Windows)
 
-1. Download the GitHub ZIP and extract it.
+1. Download the dedicated Windows ZIP from the link at the top of this page and extract it. Do not use GitHub's automatically generated source-code ZIP.
 2. Double-click `setup.bat` and wait for installation to complete.
 3. Install FFmpeg if the setup window reports that it is missing:
 
@@ -216,6 +230,10 @@ Run `winget install Gyan.FFmpeg`, open a new terminal, and verify `ffmpeg -versi
 Before transcribing longer Spaces, close memory-heavy applications such as browsers, games, video editors, or other AI applications. If available memory is very low, restart Windows or use Lightweight mode. You can also force CPU `int8` or process a shorter file. The app converts to mono 16 kHz audio and streams uploads to disk, but model inference still needs memory.
 
 In one test on this PC, processing failed with only about 0.55 GB of available memory and succeeded after restart with about 5.42 GB available; observed peak private memory was about 2.0 GB for transcription and 3.21 GB for translation. These are observations, not minimum requirements.
+
+**Windows reports WinError 206 or a file name/path is too long**
+
+Move the extracted folder to a shorter path such as `C:\XSpaceTranslator`, then run `setup.bat` again.
 
 **The first run appears slow**  
 faster-whisper and translation models download on first use. Later runs reuse the local model cache.

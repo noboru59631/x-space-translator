@@ -12,4 +12,5 @@ data/*
 /models/
 cookies.txt
 *.log
+dist/
 .DS_Store
