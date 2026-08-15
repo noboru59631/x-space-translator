@@ -18,7 +18,7 @@ class Translator:
     def available() -> bool:
         return importlib.util.find_spec("transformers") is not None
 
-    def translate(self, texts: list[str], batch_size: int = 8) -> list[str]:
+    def translate(self, texts: list[str], batch_size: int = 4) -> list[str]:
         """Translate in a short-lived process so PyTorch memory is fully released."""
         if not self.available():
             raise DependencyError(

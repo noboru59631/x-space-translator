@@ -4,6 +4,10 @@ Paste an X Space URL and read the conversation in English and Japanese.
 
 Runs locally on your PC. No paid transcription API required.
 
+**Status:** Beta
+
+**Current release:** `v0.1.0-beta`
+
 X Space Translator downloads an available X Space audio stream—or accepts a local audio/video file—then converts, transcribes, optionally separates speakers, translates to Japanese, and exports the result. The FastAPI interface is intentionally bound to `127.0.0.1` by default.
 
 > X may change its delivery format or restrict access. Direct audio retrieval from a Space URL can therefore fail. When it does, upload an audio file and continue. A failed X download is not automatically an application defect.
@@ -15,13 +19,32 @@ X Space Translator downloads an available X Space audio stream—or accepts a lo
 - Local transcription with faster-whisper and automatic CPU/CUDA selection
 - Lightweight, standard, and accurate model presets
 - Optional speaker diarization with pyannote.audio
-- Local English-to-Japanese translation with MarianMT
+- Local English-to-Japanese translation with Meta M2M100
 - English, Japanese, and bilingual views without retranscription
 - Speaker renaming reflected in every export
 - TXT, SRT, WebVTT, and JSON export
 - SQLite job/transcript cache and restart-safe completed results
 - Background jobs, progress polling, cancellation, and temporary-file cleanup
 - Local-only, responsive web UI and documented FastAPI endpoints
+
+### Core and Optional Features
+
+Core features in this beta are X Space URL/local file input, local faster-whisper transcription, English/Japanese/bilingual display, TXT/SRT/VTT/JSON export, copy, and SQLite caching.
+
+Speaker diarization, cookie-assisted X access, and GPU acceleration are optional beta features. They depend on external credentials, upstream services, hardware, or environment-specific packages and are not required for the core workflow.
+
+## Tested Environment and Example Benchmark
+
+These figures are one real-world example from a single Windows PC, not minimum requirements or guaranteed performance:
+
+- X Space length: about 22 minutes 42 seconds
+- URL retrieval: about 16 seconds; this one recording downloaded without cookies
+- Transcription: faster-whisper `base`, CPU, `int8`, 176 segments, about 3 minutes 1 second for the pipeline
+- Transcription peak private memory: about 2.0 GB
+- Translation: [`facebook/m2m100_418M`](https://huggingface.co/facebook/m2m100_418M), CPU with up to 4 threads, 176/176 segments, about 239.2 seconds
+- Translation peak private memory: about 3.21 GB
+
+During one E2E test, the X Space was downloaded successfully without cookies. Some Spaces or future X changes may still require authentication or prevent direct download.
 
 ## Screenshots
 
@@ -184,11 +207,15 @@ Real transcription requires FFmpeg plus locally downloaded models. Test only med
 **X Space audio could not be retrieved**  
 Check that the URL points to `/i/spaces/` or `/i/broadcasts/`, that a recording is publicly playable, and whether a cookie is required. X delivery changes can still prevent retrieval. Upload a legally obtained audio file instead.
 
+During one E2E test, the X Space was downloaded successfully without cookies. Some Spaces or future X changes may still require authentication or prevent direct download.
+
 **FFmpeg was not found**  
 Run `winget install Gyan.FFmpeg`, open a new terminal, and verify `ffmpeg -version`.
 
 **Out of memory**  
-Choose lightweight mode, close other programs, force CPU `int8`, or process a shorter file. The app converts to mono 16 kHz audio and streams uploads to disk, but model inference still needs memory.
+Before transcribing longer Spaces, close memory-heavy applications such as browsers, games, video editors, or other AI applications. If available memory is very low, restart Windows or use Lightweight mode. You can also force CPU `int8` or process a shorter file. The app converts to mono 16 kHz audio and streams uploads to disk, but model inference still needs memory.
+
+In one test on this PC, processing failed with only about 0.55 GB of available memory and succeeded after restart with about 5.42 GB available; observed peak private memory was about 2.0 GB for transcription and 3.21 GB for translation. These are observations, not minimum requirements.
 
 **The first run appears slow**  
 faster-whisper and translation models download on first use. Later runs reuse the local model cache.
@@ -230,6 +257,10 @@ Application source is released under the [MIT License](LICENSE). Dependencies an
 
 X SpaceのURLを貼るだけで、会話を文字起こしし、日本語で読めるローカルアプリです。文字起こし処理はあなたのPC上で実行され、有料の文字起こしAPIは不要です。
 
+**状態:** Beta
+
+**現在のリリース:** `v0.1.0-beta`
+
 ## できること
 
 - X Space URLまたはMP3/WAV/M4A/MP4/WEBMを入力
@@ -240,6 +271,25 @@ X SpaceのURLを貼るだけで、会話を文字起こしし、日本語で読�
 - English / 日本語 / EN + JA 表示
 - TXT / SRT / VTT / JSON保存と全文コピー
 - 長時間処理向けのバックグラウンドジョブ、進捗表示、SQLiteキャッシュ
+
+## コア機能と任意機能
+
+このBeta版のコア機能は、X Space URL／ローカル音声の入力、faster-whisperによるローカル文字起こし、英語・日本語・併記表示、コピー、TXT／SRT／VTT／JSON出力、SQLiteキャッシュです。
+
+話者分離、Cookieを利用したXへのアクセス、GPU高速化は任意のBeta機能です。外部認証情報、上流サービス、ハードウェア、環境依存パッケージに左右され、コア機能には必要ありません。
+
+## 実測環境とベンチマーク例
+
+以下は1台のWindows PCで得た実例であり、最低要件や処理速度を保証するものではありません。
+
+- X Spaceの長さ：約22分42秒
+- URL取得：約16秒。この録音はCookieなしで取得成功
+- 文字起こし：faster-whisper `base`、CPU、`int8`、176区間、パイプライン約3分1秒
+- 文字起こし時の最大プライベートメモリ：約2.0 GB
+- 翻訳：[`facebook/m2m100_418M`](https://huggingface.co/facebook/m2m100_418M)、CPU最大4スレッド、176/176区間、約239.2秒
+- 翻訳時の最大プライベートメモリ：約3.21 GB
+
+1回のE2Eテストでは、CookieなしでX Spaceの音声取得に成功しました。ただし、別のSpaceや今後のXの変更では、認証が必要になったり、直接取得できなくなったりする可能性があります。
 
 ## Windowsでの使い方
 
@@ -255,5 +305,7 @@ X SpaceのURLを貼るだけで、会話を文字起こしし、日本語で読�
 ## 注意事項
 
 X側の仕様変更やアクセス制限により、Space URLから直接音声を取得できない場合があります。その場合は音声ファイルアップロードを利用してください。確認していない処理を「成功」と表示するデモデータは含めていません。
+
+長めのSpaceを文字起こしする前に、ブラウザ、ゲーム、動画編集ソフト、ほかのAIアプリなど、メモリを多く使うアプリを閉じてください。空きメモリが非常に少ない場合は、Windowsを再起動するか軽量モードを利用してください。このPCでの1回の実測では、空き約0.55 GBでは失敗し、再起動後の空き約5.42 GBでは成功しました。文字起こし時の最大プライベートメモリは約2.0 GB、翻訳時は約3.21 GBでしたが、これは最低要件ではありません。
 
 音声処理は原則として利用者自身のPC上で行われます。ただし、初回のモデル取得とX URLからの音声取得には外部通信が必要です。文字起こし・翻訳する権利または許可のあるコンテンツだけを利用し、利用規約・著作権・プライバシー・法令を守ってください。
