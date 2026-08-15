@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import shutil
 import uuid
 from typing import Annotated, Literal
@@ -47,12 +48,7 @@ def public_job(job: dict) -> dict:
 def health(request: Request) -> dict:
     settings, _, _ = context(request)
     device, _ = detect_device(settings.whisper_device)
-    try:
-        import faster_whisper  # noqa: F401
-
-        whisper = True
-    except ImportError:
-        whisper = False
+    whisper = importlib.util.find_spec("faster_whisper") is not None
     return {
         "status": "ok",
         "ffmpeg": bool(find_ffmpeg()),

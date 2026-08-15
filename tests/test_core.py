@@ -1,3 +1,4 @@
+import wave
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from app.services.audio import validate_upload
 from app.services.downloader import normalize_x_url
 from app.services.errors import InvalidSourceError
 from app.services.exports import render, timestamp
+from app.services.transcriber import MAX_CHUNK_SECONDS, split_wav
 
 
 def test_normalize_supported_x_urls():
@@ -32,6 +34,21 @@ def test_upload_validation():
     assert validate_upload("talk.MP3", "audio/mpeg") == ".mp3"
     with pytest.raises(InvalidSourceError):
         validate_upload("payload.exe", "application/octet-stream")
+
+
+def test_long_wav_is_split_without_loading_it_all(tmp_path: Path):
+    audio = tmp_path / "long.wav"
+    with wave.open(str(audio), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(1)
+        output.writeframes(b"\0\0" * (MAX_CHUNK_SECONDS * 2 + 1))
+
+    chunks, duration = split_wav(audio)
+
+    assert duration == MAX_CHUNK_SECONDS * 2 + 1
+    assert [offset for _, offset in chunks] == [0, 1200, 2400]
+    assert all(path.exists() for path, _ in chunks)
 
 
 def test_timestamp_and_exports():
