@@ -3,8 +3,7 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     WORKER_TEMP_DIR=/tmp/x-space-worker \
-    HF_HOME=/home/appuser/.cache/huggingface \
-    PORT=7860
+    HF_HOME=/home/appuser/.cache/huggingface
 
 WORKDIR /workspace
 
@@ -24,6 +23,6 @@ RUN mkdir -p /tmp/x-space-worker /home/appuser/.cache/huggingface \
     && chown -R appuser:appuser /tmp/x-space-worker /home/appuser
 
 USER appuser
-EXPOSE 7860
+EXPOSE 8080
 
-CMD ["python", "-m", "uvicorn", "cloud.worker.app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["python", "-m", "cloud.worker.app"]

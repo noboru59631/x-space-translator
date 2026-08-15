@@ -64,7 +64,7 @@ class Transcriber:
 
     def __init__(self) -> None:
         self._model = None
-        self._key: tuple[str, str, str] | None = None
+        self._key: tuple[str, str, str, int] | None = None
 
     def transcribe(
         self,
@@ -74,6 +74,7 @@ class Transcriber:
         model_override: str,
         compute_override: str,
         progress: Callable[[int], None] | None = None,
+        cpu_threads: int = 0,
     ) -> dict[str, object]:
         try:
             from faster_whisper import WhisperModel
@@ -82,14 +83,21 @@ class Transcriber:
                 "faster-whisperがインストールされていません。setup.batを実行してください。"
             ) from exc
         device, compute = detect_device(device_preference)
-        model_name = MODELS.get(mode, model_override or "small")
+        model_name = (
+            model_override or "base"
+            if mode == "cloud"
+            else MODELS.get(mode, model_override or "small")
+        )
         if device_preference != "auto" and compute_override != "auto":
             compute = compute_override
-        key = (model_name, device, compute)
+        key = (model_name, device, compute, cpu_threads)
         try:
             if self._model is None or self._key != key:
                 self._model = WhisperModel(
-                    model_name, device=device, compute_type=compute
+                    model_name,
+                    device=device,
+                    compute_type=compute,
+                    cpu_threads=cpu_threads,
                 )
                 self._key = key
             segments = []
@@ -99,7 +107,7 @@ class Transcriber:
             for chunk_path, offset in chunks:
                 segments_iter, info = self._model.transcribe(
                     str(chunk_path),
-                    beam_size=1 if mode == "light" else 5,
+                    beam_size=1 if mode in {"light", "cloud"} else 5,
                     vad_filter=True,
                     condition_on_previous_text=True,
                 )
