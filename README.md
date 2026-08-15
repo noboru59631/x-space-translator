@@ -223,6 +223,20 @@ faster-whisper and translation models download on first use. Later runs reuse th
 **Speaker diarization is unavailable**  
 Install `requirements-gpu.txt`, accept the pyannote model terms, and set `HF_TOKEN`. Transcription itself does not require diarization.
 
+## View transcripts in Bankr
+
+After transcription, save the JSON file and open it in the Bankr Transcript Viewer.
+
+Bankr Viewer supports:
+
+- English
+- Japanese
+- EN + JA
+- Search
+- Speaker filtering
+
+Transcript JSON is currently loaded locally in the browser and is not automatically uploaded to Bankr. Bankr is an optional viewer; transcription, translation, and exports do not depend on it.
+
 ## Privacy
 
 Audio processing is designed to run on your PC. Uploaded media is written only to a per-job temporary directory and removed after processing. Results and job state are stored in `data/x_space_translator.db`. Initial model downloads and X URL retrieval require external network connections; media is not otherwise deliberately sent to a paid transcription or translation API.
@@ -301,6 +315,20 @@ X SpaceのURLを貼るだけで、会話を文字起こしし、日本語で読�
 6. Xから取得できない場合は「音声ファイル」に切り替えて続行します。
 
 話者分離を使わない場合、Hugging Face Tokenは不要です。CookieやTokenは`.env`にだけ保存し、GitHubへcommitしないでください。
+
+## Bankrで文字起こしを見る
+
+文字起こし完了後にJSONファイルを保存し、Bankr Transcript Viewerで開くことができます。
+
+Bankr Viewerでは以下を利用できます。
+
+- English
+- 日本語
+- EN + JA
+- 検索
+- Speakerフィルター
+
+Transcript JSONは現在ブラウザ内でローカルに読み込まれ、Bankrへ自動アップロードされません。Bankrは任意のViewerであり、文字起こし・翻訳・各種出力はBankrに依存しません。
 
 ## 注意事項
 

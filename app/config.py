@@ -5,8 +5,13 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BANKR_VIEWER_URL = (
+    "https://bankr.bot/u/0x7b9af3d72ad97aa15db0e0cc6c1b747904653645/"
+    "apps/space-youtube-transcriber"
+)
 
 
 class Settings(BaseSettings):
@@ -21,6 +26,7 @@ class Settings(BaseSettings):
     whisper_compute_type: str = "auto"
     hf_token: str = ""
     x_cookie_file: str = ""
+    bankr_viewer_url: HttpUrl = HttpUrl(BANKR_VIEWER_URL)
     max_upload_mb: int = Field(default=2048, ge=1)
     temp_dir: Path = Path("./temp")
     data_dir: Path = Path("./data")

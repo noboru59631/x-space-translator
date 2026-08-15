@@ -51,4 +51,10 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html")
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={
+            "bankr_viewer_url": str(request.app.state.settings.bankr_viewer_url)
+        },
+    )

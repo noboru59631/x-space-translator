@@ -42,8 +42,15 @@
       <div class="result-head"><div><span class="eyebrow">TRANSCRIPT</span><h2 id="result-title">文字起こし結果</h2><p id="meta"></p></div><button id="translate" class="secondary">日本語に翻訳</button></div>
       <div class="toolbar">
         <div class="segmented"><button data-display="en" class="active">English</button><button data-display="ja">日本語</button><button data-display="both">EN + JA</button></div>
-        <div class="exports"><button data-format="txt">TXT</button><button data-format="srt">SRT</button><button data-format="vtt">VTT</button><button data-format="json">JSON</button><button id="copy">コピー</button></div>
+        <div class="exports"><button data-format="txt">TXT</button><button data-format="srt">SRT</button><button data-format="vtt">VTT</button><button data-format="json">JSON</button><a id="bankr-viewer" class="button-link bankr-link" href="{{ bankr_viewer_url }}" target="_blank" rel="noopener noreferrer">Bankrで結果を見る</a><button id="copy">コピー</button></div>
       </div>
+      <aside class="bankr-panel" aria-labelledby="bankr-heading">
+        <div>
+          <h3 id="bankr-heading">Bankr Viewerで読む</h3>
+          <p>保存したJSONをBankr Viewerで読み込むと、検索・Speakerフィルター・EN/JA切替で閲覧できます。</p>
+        </div>
+        <p class="privacy-note">Bankr ViewerではJSONをブラウザ内で読み込みます。現在、TranscriptをBankrサーバーへ自動送信する機能はありません。</p>
+      </aside>
       <div id="speaker-editor" class="speaker-editor"></div>
       <div id="segments" class="segments"></div>
     </section>
