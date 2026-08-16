@@ -25,6 +25,9 @@ AAC/M4A file, the job fails before contacting Groq.
 The following endpoints require
 `Authorization: Bearer <BRIDGE_API_KEY>`:
 
+- `POST /api/jobs`
+- `GET /api/jobs/{job_id}`
+- `GET /api/jobs/{job_id}/result`
 - `POST /jobs`
 - `POST /transcribe` (job-creation alias)
 - `GET /jobs/{job_id}`
@@ -36,12 +39,21 @@ Example request:
 {"url": "https://x.com/i/spaces/1qxvvvQBRXQxB/peek"}
 ```
 
-Both POST endpoints return HTTP 202 with a random `job_id`. Poll the status
-endpoint until it reaches `completed`, then read the result endpoint. A second
-submission while one job is active receives HTTP 429.
+`POST /api/jobs` returns HTTP 202 immediately with a random `job_id`; download,
+FFmpeg, and Groq work run on the single background worker. Poll the matching
+status endpoint until it reaches `completed`, then read the result endpoint.
+Progress is `null` because the bridge does not invent a percentage it cannot
+measure accurately. A second submission while one job is active receives HTTP
+429.
+
+Completed and failed API results remain in memory for `JOB_TTL_SECONDS` (30
+minutes by default). Audio and the complete job temp directory are deleted as
+soon as processing finishes; only transcript JSON remains in the job store.
+The legacy `/jobs` and `/transcribe` routes remain available for compatibility.
 
 Jobs and results are held only in memory. They disappear on a Render restart,
-deploy, or free-instance spin-down. This is a PoC limitation.
+deploy, or free-instance spin-down. Production should use an external durable
+job store. This is a PoC limitation.
 
 ## Local Docker
 

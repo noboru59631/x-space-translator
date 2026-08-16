@@ -15,5 +15,5 @@ services:
         sync: false
       - key: GROQ_MAX_UPLOAD_MB
         value: "25"
-      - key: RESULT_TTL_SECONDS
-        value: "3600"
+      - key: JOB_TTL_SECONDS
+        value: "1800"

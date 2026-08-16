@@ -16,6 +16,8 @@ from typing import Annotated
 
 import psutil
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -31,7 +33,10 @@ WORK_ROOT = Path(
 )
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 MAX_JSON_BODY_BYTES = 8192
-RESULT_TTL_SECONDS = max(60, int(os.getenv("RESULT_TTL_SECONDS", "3600")))
+JOB_TTL_SECONDS = max(
+    600,
+    int(os.getenv("JOB_TTL_SECONDS", os.getenv("RESULT_TTL_SECONDS", "1800"))),
+)
 GROQ_FREE_MAX_MB = 25
 
 
@@ -74,12 +79,13 @@ class JobManager:
 
     def submit(self, source_url: str) -> dict[str, object]:
         job = self._reserve(source_url)
+        queued_view = self.status_view(job)
         try:
             self.executor.submit(self._run, str(job["job_id"]), source_url)
         except Exception:
             self._abandon(str(job["job_id"]))
             raise
-        return self.status_view(job)
+        return queued_view
 
     def get(self, job_id: str) -> dict[str, object] | None:
         self._expire()
@@ -115,16 +121,42 @@ class JobManager:
             return dict(result)
         return cls.status_view(job)
 
+    @staticmethod
+    def api_status_view(job: dict[str, object]) -> dict[str, object]:
+        view: dict[str, object] = {
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "stage": job["stage"],
+            "progress": None,
+        }
+        if job.get("status") == "failed":
+            view["error_code"] = job.get("public_error_code") or "INTERNAL_ERROR"
+        return view
+
+    @classmethod
+    def api_result_view(cls, job: dict[str, object]) -> dict[str, object]:
+        status_value = str(job["status"])
+        view: dict[str, object] = {
+            "job_id": job["job_id"],
+            "status": status_value,
+        }
+        if status_value == "completed" and isinstance(job.get("result"), dict):
+            view["result"] = dict(job["result"])  # type: ignore[arg-type]
+        elif status_value == "failed":
+            view["error_code"] = job.get("public_error_code") or "INTERNAL_ERROR"
+        return view
+
     def _reserve(self, source_url: str) -> dict[str, object]:
         job_id = uuid.uuid4().hex
         job: dict[str, object] = {
             "job_id": job_id,
             "status": "queued",
             "stage": "queued",
-            "progress": 0,
+            "progress": None,
             "source_url": source_url,
             "created_at": time.time(),
             "error_code": None,
+            "public_error_code": None,
             "error": None,
             "media_duration": None,
             "media_size_bytes": None,
@@ -136,6 +168,7 @@ class JobManager:
             "peak_memory_mb": None,
             "cleanup": False,
             "result": None,
+            "finished_at": None,
         }
         with self.lock:
             if self.active_job_id is not None:
@@ -173,7 +206,7 @@ class JobManager:
                 job_id,
                 status="processing",
                 stage="downloading",
-                progress=10,
+                progress=None,
             )
             source, metadata = download_space(source_url, job_dir)
             self._update(
@@ -182,7 +215,7 @@ class JobManager:
             )
 
             remux_started = time.perf_counter()
-            self._update(job_id, stage="validating", progress=35)
+            self._update(job_id, stage="validating_audio", progress=None)
             m4a_path = remux_to_m4a(source, job_dir / "groq-upload.m4a")
             media = probe_m4a(m4a_path)
             self._update(
@@ -191,7 +224,7 @@ class JobManager:
                 media_size_bytes=media.size_bytes,
                 media_codec=media.codec,
                 remux_seconds=round(time.perf_counter() - remux_started, 3),
-                progress=55,
+                progress=None,
             )
             if media.size_bytes > groq_upload_limit_bytes():
                 raise BridgeError(
@@ -200,7 +233,7 @@ class JobManager:
                 )
 
             groq_started = time.perf_counter()
-            self._update(job_id, stage="transcribing", progress=65)
+            self._update(job_id, stage="transcribing", progress=None)
             transcript = transcribe_m4a(
                 m4a_path,
                 os.environ["GROQ_API_KEY"],
@@ -208,8 +241,9 @@ class JobManager:
             self._update(
                 job_id,
                 groq_seconds=round(time.perf_counter() - groq_started, 3),
-                progress=95,
+                progress=None,
             )
+            self._update(job_id, stage="preparing_result", progress=None)
             result = {
                 "title": str(metadata.get("title") or ""),
                 "source_url": source_url,
@@ -231,7 +265,8 @@ class JobManager:
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
                 "peak_memory_mb": round(peak[0], 1),
                 "cleanup": not job_dir.exists(),
-                "progress": 100,
+                "progress": None,
+                "finished_at": time.time(),
             }
             if result is not None:
                 self._update(
@@ -249,6 +284,7 @@ class JobManager:
                     status="failed",
                     stage="failed",
                     error_code=code,
+                    public_error_code=public_error_code(code),
                     error=message,
                 )
             self._finish(job_id)
@@ -279,12 +315,12 @@ class JobManager:
         return stopped, peak
 
     def _expire(self) -> None:
-        cutoff = time.time() - RESULT_TTL_SECONDS
+        cutoff = time.time() - JOB_TTL_SECONDS
         with self.lock:
             expired = [
                 job_id
                 for job_id, job in self.jobs.items()
-                if float(job["created_at"]) < cutoff
+                if float(job.get("finished_at") or job["created_at"]) < cutoff
                 and job["status"] not in {"queued", "processing"}
             ]
             for job_id in expired:
@@ -307,13 +343,55 @@ def classify_download_failure(exc: BaseException) -> str:
     return "DOWNLOAD_ERROR"
 
 
+def public_error_code(internal_code: str) -> str:
+    """Map internal diagnostics to a small, stable Bankr-facing code set."""
+    if internal_code in {
+        "AUTH_REQUIRED",
+        "BLOCKED",
+        "EXTRACTOR_ERROR",
+        "NETWORK_ERROR",
+        "DOWNLOAD_ERROR",
+    }:
+        return "X_DOWNLOAD_FAILED"
+    if internal_code.startswith("GROQ_"):
+        return "GROQ_TRANSCRIPTION_FAILED"
+    if internal_code in {
+        "INVALID_MEDIA",
+        "INVALID_CONTAINER",
+        "INVALID_AUDIO_CODEC",
+        "INVALID_DURATION",
+        "REMUX_FAILED",
+        "FFMPEG_MISSING",
+        "FFPROBE_MISSING",
+    }:
+        return "AUDIO_INVALID"
+    return "INTERNAL_ERROR"
+
+
 manager = JobManager()
 app = FastAPI(title="X Space Translator Render Bridge PoC", version="0.1.0-poc")
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    if request.url.path == "/api/jobs":
+        return JSONResponse(
+            {"error_code": "INVALID_URL"},
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
 @app.middleware("http")
 async def limit_json_body(request: Request, call_next):  # type: ignore[no-untyped-def]
-    if request.method == "POST" and request.url.path in {"/jobs", "/transcribe"}:
+    if request.method == "POST" and request.url.path in {
+        "/jobs",
+        "/transcribe",
+        "/api/jobs",
+    }:
         content_length = request.headers.get("content-length")
         try:
             declared_length = int(content_length) if content_length else 0
@@ -350,7 +428,11 @@ def require_bridge_key(
         )
 
 
-def submit_job(payload: TranscribeRequest) -> dict[str, object]:
+def submit_job(
+    payload: TranscribeRequest,
+    *,
+    busy_detail: str | None = None,
+) -> dict[str, object]:
     if not os.getenv("GROQ_API_KEY"):
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -359,7 +441,10 @@ def submit_job(payload: TranscribeRequest) -> dict[str, object]:
     try:
         return manager.submit(payload.url)
     except BusyError as exc:
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            busy_detail or str(exc),
+        ) from exc
 
 
 @app.get("/")
@@ -393,6 +478,15 @@ def transcribe(
     return submit_job(payload)
 
 
+@app.post("/api/jobs", status_code=status.HTTP_202_ACCEPTED)
+def create_api_job(
+    payload: TranscribeRequest,
+    _: Annotated[None, Depends(require_bridge_key)],
+) -> dict[str, object]:
+    job = submit_job(payload, busy_detail="BUSY")
+    return {"job_id": job["job_id"], "status": job["status"]}
+
+
 def find_job(job_id: str) -> dict[str, object]:
     job = manager.get(job_id)
     if not job:
@@ -414,3 +508,19 @@ def get_result(
     _: Annotated[None, Depends(require_bridge_key)],
 ) -> dict[str, object]:
     return manager.result_view(find_job(job_id))
+
+
+@app.get("/api/jobs/{job_id}")
+def get_api_job(
+    job_id: str,
+    _: Annotated[None, Depends(require_bridge_key)],
+) -> dict[str, object]:
+    return manager.api_status_view(find_job(job_id))
+
+
+@app.get("/api/jobs/{job_id}/result")
+def get_api_result(
+    job_id: str,
+    _: Annotated[None, Depends(require_bridge_key)],
+) -> dict[str, object]:
+    return manager.api_result_view(find_job(job_id))

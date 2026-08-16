@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -72,6 +73,13 @@ def test_authentication_and_missing_configuration(
     assert client.post("/jobs", json=payload, headers=AUTH).status_code == 503
 
 
+def test_api_job_requires_authentication(client: TestClient) -> None:
+    response = client.post("/api/jobs", json={"url": SPACE_URL})
+    assert response.status_code == 401
+    assert client.get("/api/jobs/unknown").status_code == 401
+    assert client.get("/api/jobs/unknown/result").status_code == 401
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -88,6 +96,16 @@ def test_url_validation_rejects_non_x_and_ssrf(
 ) -> None:
     response = client.post("/jobs", json={"url": url}, headers=AUTH)
     assert response.status_code == 422
+
+
+def test_api_job_rejects_invalid_url(client: TestClient) -> None:
+    response = client.post(
+        "/api/jobs",
+        json={"url": "http://127.0.0.1/i/spaces/example"},
+        headers=AUTH,
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error_code": "INVALID_URL"}
 
 
 def test_twitter_url_is_normalized(
@@ -123,6 +141,124 @@ def test_busy_control(client: TestClient) -> None:
         bridge.manager.active_job_id = "active"
     response = client.post("/jobs", json={"url": SPACE_URL}, headers=AUTH)
     assert response.status_code == 429
+    api_response = client.post("/api/jobs", json={"url": SPACE_URL}, headers=AUTH)
+    assert api_response.status_code == 429
+    assert api_response.json() == {"detail": "BUSY"}
+
+
+def test_api_job_returns_quickly(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        bridge.manager,
+        "submit",
+        lambda url: {"job_id": "a" * 32, "status": "queued"},
+    )
+    started = time.perf_counter()
+    response = client.post("/api/jobs", json={"url": SPACE_URL}, headers=AUTH)
+    elapsed = time.perf_counter() - started
+    assert response.status_code == 202
+    assert response.json() == {"job_id": "a" * 32, "status": "queued"}
+    assert elapsed < 1.0
+
+
+def test_job_id_is_random_uuid(client: TestClient) -> None:
+    job = bridge.manager._reserve(SPACE_URL)
+    try:
+        assert re.fullmatch(r"[0-9a-f]{32}", str(job["job_id"]))
+    finally:
+        bridge.manager._abandon(str(job["job_id"]))
+
+
+def test_api_job_status_has_null_progress(client: TestClient) -> None:
+    with bridge.manager.lock:
+        bridge.manager.jobs["status"] = {
+            "job_id": "status",
+            "status": "processing",
+            "stage": "validating_audio",
+            "progress": None,
+            "created_at": time.time(),
+        }
+    response = client.get("/api/jobs/status", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json() == {
+        "job_id": "status",
+        "status": "processing",
+        "stage": "validating_audio",
+        "progress": None,
+    }
+
+
+def test_api_completed_result_is_wrapped(client: TestClient) -> None:
+    transcript = {
+        "title": "Test",
+        "source_url": SPACE_URL,
+        "detected_language": "en",
+        "duration": 1.0,
+        "segments": [],
+    }
+    with bridge.manager.lock:
+        bridge.manager.jobs["done"] = {
+            "job_id": "done",
+            "status": "completed",
+            "stage": "completed",
+            "created_at": time.time(),
+            "finished_at": time.time(),
+            "result": transcript,
+        }
+    response = client.get("/api/jobs/done/result", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json() == {
+        "job_id": "done",
+        "status": "completed",
+        "result": transcript,
+    }
+
+
+def test_api_processing_result_is_minimal(client: TestClient) -> None:
+    with bridge.manager.lock:
+        bridge.manager.jobs["waiting"] = {
+            "job_id": "waiting",
+            "status": "processing",
+            "stage": "transcribing",
+            "created_at": time.time(),
+        }
+    response = client.get("/api/jobs/waiting/result", headers=AUTH)
+    assert response.json() == {"job_id": "waiting", "status": "processing"}
+
+
+def test_api_failed_job_exposes_only_public_error(client: TestClient) -> None:
+    with bridge.manager.lock:
+        bridge.manager.jobs["failed"] = {
+            "job_id": "failed",
+            "status": "failed",
+            "stage": "failed",
+            "created_at": time.time(),
+            "finished_at": time.time(),
+            "public_error_code": "GROQ_TRANSCRIPTION_FAILED",
+            "error": "internal details must stay private",
+        }
+    response = client.get("/api/jobs/failed", headers=AUTH)
+    assert response.json()["error_code"] == "GROQ_TRANSCRIPTION_FAILED"
+    assert "error" not in response.json()
+
+
+def test_api_unknown_job_returns_404(client: TestClient) -> None:
+    assert client.get("/api/jobs/missing", headers=AUTH).status_code == 404
+
+
+def test_completed_job_expires_after_ttl(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "JOB_TTL_SECONDS", 600)
+    with bridge.manager.lock:
+        bridge.manager.jobs["expired"] = {
+            "job_id": "expired",
+            "status": "completed",
+            "created_at": time.time() - 1200,
+            "finished_at": time.time() - 601,
+        }
+    assert bridge.manager.get("expired") is None
 
 
 def test_job_result_and_cleanup(
@@ -370,3 +506,16 @@ def test_download_failure_classification(message: str, expected: str) -> None:
 def test_bridge_error_does_not_include_secrets() -> None:
     error = BridgeError("GROQ_ERROR", "Groq returned HTTP 500")
     assert "secret" not in str(error).lower()
+
+
+@pytest.mark.parametrize(
+    ("internal", "public"),
+    [
+        ("AUTH_REQUIRED", "X_DOWNLOAD_FAILED"),
+        ("REMUX_FAILED", "AUDIO_INVALID"),
+        ("GROQ_RATE_LIMIT", "GROQ_TRANSCRIPTION_FAILED"),
+        ("CODE_ERROR", "INTERNAL_ERROR"),
+    ],
+)
+def test_public_error_classification(internal: str, public: str) -> None:
+    assert bridge.public_error_code(internal) == public
