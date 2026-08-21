@@ -17,3 +17,9 @@ services:
         value: "25"
       - key: JOB_TTL_SECONDS
         value: "1800"
+      - key: PUBLIC_RATE_LIMIT_JOBS
+        value: "2"
+      - key: PUBLIC_RATE_LIMIT_WINDOW_SECONDS
+        value: "600"
+      - key: PUBLIC_MAX_AUDIO_SECONDS
+        value: "7200"

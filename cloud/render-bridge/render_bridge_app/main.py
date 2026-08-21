@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import importlib.util
 import logging
 import os
@@ -10,6 +11,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated
@@ -38,10 +40,66 @@ JOB_TTL_SECONDS = max(
     int(os.getenv("JOB_TTL_SECONDS", os.getenv("RESULT_TTL_SECONDS", "1800"))),
 )
 GROQ_FREE_MAX_MB = 25
+PUBLIC_RATE_LIMIT_JOBS = max(1, int(os.getenv("PUBLIC_RATE_LIMIT_JOBS", "2")))
+PUBLIC_RATE_LIMIT_WINDOW_SECONDS = max(
+    60,
+    int(os.getenv("PUBLIC_RATE_LIMIT_WINDOW_SECONDS", "600")),
+)
+PUBLIC_MAX_AUDIO_SECONDS = max(
+    60,
+    int(os.getenv("PUBLIC_MAX_AUDIO_SECONDS", "7200")),
+)
 
 
 class BusyError(RuntimeError):
     """Only one download/transcription job can run on a free instance."""
+
+
+class RateLimitError(RuntimeError):
+    """A public client has exhausted its job creation allowance."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__("Public job rate limit exceeded")
+        self.retry_after = retry_after
+
+
+class IpRateLimiter:
+    """Small in-memory fixed-window limiter for the public PoC endpoint."""
+
+    def __init__(self, limit: int, window_seconds: int) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.events: dict[str, deque[float]] = {}
+        self.lock = threading.Lock()
+
+    def consume(self, client_ip: str) -> float:
+        now = time.time()
+        cutoff = now - self.window_seconds
+        with self.lock:
+            events = self.events.setdefault(client_ip, deque())
+            while events and events[0] <= cutoff:
+                events.popleft()
+            if len(events) >= self.limit:
+                retry_after = max(1, int(events[0] + self.window_seconds - now) + 1)
+                raise RateLimitError(retry_after)
+            events.append(now)
+        return now
+
+    def refund(self, client_ip: str, event: float) -> None:
+        with self.lock:
+            events = self.events.get(client_ip)
+            if not events:
+                return
+            try:
+                events.remove(event)
+            except ValueError:
+                return
+            if not events:
+                self.events.pop(client_ip, None)
+
+    def clear(self) -> None:
+        with self.lock:
+            self.events.clear()
 
 
 class TranscribeRequest(BaseModel):
@@ -77,11 +135,21 @@ class JobManager:
         with self.lock:
             return self.active_job_id is not None
 
-    def submit(self, source_url: str) -> dict[str, object]:
-        job = self._reserve(source_url)
+    def submit(
+        self,
+        source_url: str,
+        *,
+        visibility: str = "authenticated",
+    ) -> dict[str, object]:
+        job = self._reserve(source_url, visibility=visibility)
         queued_view = self.status_view(job)
         try:
-            self.executor.submit(self._run, str(job["job_id"]), source_url)
+            self.executor.submit(
+                self._run,
+                str(job["job_id"]),
+                source_url,
+                visibility,
+            )
         except Exception:
             self._abandon(str(job["job_id"]))
             raise
@@ -146,7 +214,12 @@ class JobManager:
             view["error_code"] = job.get("public_error_code") or "INTERNAL_ERROR"
         return view
 
-    def _reserve(self, source_url: str) -> dict[str, object]:
+    def _reserve(
+        self,
+        source_url: str,
+        *,
+        visibility: str = "authenticated",
+    ) -> dict[str, object]:
         job_id = uuid.uuid4().hex
         job: dict[str, object] = {
             "job_id": job_id,
@@ -154,6 +227,7 @@ class JobManager:
             "stage": "queued",
             "progress": None,
             "source_url": source_url,
+            "visibility": visibility,
             "created_at": time.time(),
             "error_code": None,
             "public_error_code": None,
@@ -193,7 +267,7 @@ class JobManager:
             if self.active_job_id == job_id:
                 self.active_job_id = None
 
-    def _run(self, job_id: str, source_url: str) -> None:
+    def _run(self, job_id: str, source_url: str, visibility: str) -> None:
         job_dir = WORK_ROOT / job_id
         started = time.perf_counter()
         stop_sampling, peak = self._start_memory_sampler()
@@ -226,6 +300,14 @@ class JobManager:
                 remux_seconds=round(time.perf_counter() - remux_started, 3),
                 progress=None,
             )
+            if (
+                visibility == "public"
+                and media.duration > PUBLIC_MAX_AUDIO_SECONDS
+            ):
+                raise BridgeError(
+                    "AUDIO_TOO_LONG",
+                    "The X Space exceeds the public API duration limit",
+                )
             if media.size_bytes > groq_upload_limit_bytes():
                 raise BridgeError(
                     "GROQ_FILE_TOO_LARGE",
@@ -363,12 +445,21 @@ def public_error_code(internal_code: str) -> str:
         "REMUX_FAILED",
         "FFMPEG_MISSING",
         "FFPROBE_MISSING",
+        "AUDIO_TOO_LONG",
     }:
-        return "AUDIO_INVALID"
+        return (
+            "AUDIO_TOO_LONG"
+            if internal_code == "AUDIO_TOO_LONG"
+            else "AUDIO_INVALID"
+        )
     return "INTERNAL_ERROR"
 
 
 manager = JobManager()
+public_rate_limiter = IpRateLimiter(
+    PUBLIC_RATE_LIMIT_JOBS,
+    PUBLIC_RATE_LIMIT_WINDOW_SECONDS,
+)
 app = FastAPI(title="X Space Translator Render Bridge PoC", version="0.1.0-poc")
 
 
@@ -377,7 +468,7 @@ async def validation_exception_handler(
     request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
-    if request.url.path == "/api/jobs":
+    if request.url.path in {"/api/jobs", "/public/jobs"}:
         return JSONResponse(
             {"error_code": "INVALID_URL"},
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -391,6 +482,7 @@ async def limit_json_body(request: Request, call_next):  # type: ignore[no-untyp
         "/jobs",
         "/transcribe",
         "/api/jobs",
+        "/public/jobs",
     }:
         content_length = request.headers.get("content-length")
         try:
@@ -432,6 +524,7 @@ def submit_job(
     payload: TranscribeRequest,
     *,
     busy_detail: str | None = None,
+    visibility: str = "authenticated",
 ) -> dict[str, object]:
     if not os.getenv("GROQ_API_KEY"):
         raise HTTPException(
@@ -439,7 +532,7 @@ def submit_job(
             "GROQ_API_KEY is not configured",
         )
     try:
-        return manager.submit(payload.url)
+        return manager.submit(payload.url, visibility=visibility)
     except BusyError as exc:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
@@ -487,9 +580,54 @@ def create_api_job(
     return {"job_id": job["job_id"], "status": job["status"]}
 
 
+def public_client_ip(request: Request) -> str:
+    """Return Render's first forwarded client address, failing closed."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    candidate = forwarded.split(",", 1)[0].strip() if forwarded else ""
+    if not candidate and request.client:
+        candidate = request.client.host
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return "unknown"
+
+
+@app.post("/public/jobs", status_code=status.HTTP_202_ACCEPTED)
+def create_public_job(
+    payload: TranscribeRequest,
+    request: Request,
+) -> dict[str, object]:
+    client_ip = public_client_ip(request)
+    try:
+        rate_event = public_rate_limiter.consume(client_ip)
+    except RateLimitError as exc:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    try:
+        job = submit_job(
+            payload,
+            busy_detail="BUSY",
+            visibility="public",
+        )
+    except Exception:
+        public_rate_limiter.refund(client_ip, rate_event)
+        raise
+    return {"job_id": job["job_id"], "status": job["status"]}
+
+
 def find_job(job_id: str) -> dict[str, object]:
     job = manager.get(job_id)
     if not job:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
+    return job
+
+
+def find_public_job(job_id: str) -> dict[str, object]:
+    job = find_job(job_id)
+    if job.get("visibility") != "public":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
     return job
 
@@ -524,3 +662,13 @@ def get_api_result(
     _: Annotated[None, Depends(require_bridge_key)],
 ) -> dict[str, object]:
     return manager.api_result_view(find_job(job_id))
+
+
+@app.get("/public/jobs/{job_id}")
+def get_public_job(job_id: str) -> dict[str, object]:
+    return manager.api_status_view(find_public_job(job_id))
+
+
+@app.get("/public/jobs/{job_id}/result")
+def get_public_result(job_id: str) -> dict[str, object]:
+    return manager.api_result_view(find_public_job(job_id))

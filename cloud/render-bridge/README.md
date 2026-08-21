@@ -22,6 +22,26 @@ AAC/M4A file, the job fails before contacting Groq.
 
 `GET /health` is public and returns only dependency availability.
 
+Bankr can use these secretless, X-Spaces-only endpoints:
+
+- `POST /public/jobs`
+- `GET /public/jobs/{job_id}`
+- `GET /public/jobs/{job_id}/result`
+
+The public creation endpoint accepts only allowlisted X/Twitter Space and
+broadcast URLs. It rejects YouTube, arbitrary hosts and schemes, localhost,
+private IP targets, and oversized request bodies. Public jobs have random UUID
+identifiers and cannot be used to read jobs created through authenticated
+routes.
+
+The default public limit is two accepted jobs per source IP per 10 minutes.
+Only one job can run across the complete service at a time; another submission
+receives HTTP 429 `BUSY` and does not consume its IP allowance. Public audio is
+limited to two hours and is rejected before Groq upload when the validated
+duration is longer. These controls are configurable with
+`PUBLIC_RATE_LIMIT_JOBS`, `PUBLIC_RATE_LIMIT_WINDOW_SECONDS`, and
+`PUBLIC_MAX_AUDIO_SECONDS`.
+
 The following endpoints require
 `Authorization: Bearer <BRIDGE_API_KEY>`:
 
@@ -53,7 +73,8 @@ The legacy `/jobs` and `/transcribe` routes remain available for compatibility.
 
 Jobs and results are held only in memory. They disappear on a Render restart,
 deploy, or free-instance spin-down. Production should use an external durable
-job store. This is a PoC limitation.
+job store. The public rate limiter is also in memory and resets on restart.
+This is a PoC limitation.
 
 ## Local Docker
 

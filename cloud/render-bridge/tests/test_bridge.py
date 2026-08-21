@@ -31,6 +31,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     with bridge.manager.lock:
         bridge.manager.jobs.clear()
         bridge.manager.active_job_id = None
+    bridge.public_rate_limiter.clear()
     return TestClient(app)
 
 
@@ -113,7 +114,11 @@ def test_twitter_url_is_normalized(
 ) -> None:
     captured: list[str] = []
 
-    def fake_submit(url: str) -> dict[str, object]:
+    def fake_submit(
+        url: str,
+        *,
+        visibility: str = "authenticated",
+    ) -> dict[str, object]:
         captured.append(url)
         return {"job_id": "test", "status": "queued"}
 
@@ -134,6 +139,12 @@ def test_json_body_limit(client: TestClient) -> None:
         headers={**AUTH, "Content-Type": "application/json"},
     )
     assert response.status_code == 413
+    public_response = client.post(
+        "/public/jobs",
+        content=b"x" * (bridge.MAX_JSON_BODY_BYTES + 1),
+        headers={"Content-Type": "application/json"},
+    )
+    assert public_response.status_code == 413
 
 
 def test_busy_control(client: TestClient) -> None:
@@ -152,7 +163,7 @@ def test_api_job_returns_quickly(
     monkeypatch.setattr(
         bridge.manager,
         "submit",
-        lambda url: {"job_id": "a" * 32, "status": "queued"},
+        lambda url, **kwargs: {"job_id": "a" * 32, "status": "queued"},
     )
     started = time.perf_counter()
     response = client.post("/api/jobs", json={"url": SPACE_URL}, headers=AUTH)
@@ -168,6 +179,132 @@ def test_job_id_is_random_uuid(client: TestClient) -> None:
         assert re.fullmatch(r"[0-9a-f]{32}", str(job["job_id"]))
     finally:
         bridge.manager._abandon(str(job["job_id"]))
+
+
+def test_public_job_needs_no_secret_and_returns_quickly(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_submit(
+        url: str,
+        *,
+        visibility: str = "authenticated",
+    ) -> dict[str, object]:
+        captured["url"] = url
+        captured["visibility"] = visibility
+        return {"job_id": "b" * 32, "status": "queued"}
+
+    monkeypatch.setattr(bridge.manager, "submit", fake_submit)
+    started = time.perf_counter()
+    response = client.post(
+        "/public/jobs",
+        json={"url": SPACE_URL},
+        headers={"X-Forwarded-For": "198.51.100.10"},
+    )
+    assert time.perf_counter() - started < 1.0
+    assert response.status_code == 202
+    assert response.json() == {"job_id": "b" * 32, "status": "queued"}
+    assert captured == {"url": SPACE_URL, "visibility": "public"}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://youtube.com/watch?v=x",
+        "http://localhost/i/spaces/example",
+        "http://127.0.0.1/i/spaces/example",
+        "file:///etc/passwd",
+        "ftp://x.com/i/spaces/example",
+        "https://example.com/i/spaces/example",
+    ],
+)
+def test_public_job_rejects_arbitrary_urls(client: TestClient, url: str) -> None:
+    response = client.post("/public/jobs", json={"url": url})
+    assert response.status_code == 422
+    assert response.json() == {"error_code": "INVALID_URL"}
+
+
+def test_public_rate_limit_is_per_ip(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counter = 0
+
+    def fake_submit(url: str, **kwargs: object) -> dict[str, object]:
+        nonlocal counter
+        counter += 1
+        return {"job_id": f"{counter:032x}", "status": "queued"}
+
+    monkeypatch.setattr(bridge.manager, "submit", fake_submit)
+    headers = {"X-Forwarded-For": "198.51.100.11"}
+    assert client.post("/public/jobs", json={"url": SPACE_URL}, headers=headers).status_code == 202
+    assert client.post("/public/jobs", json={"url": SPACE_URL}, headers=headers).status_code == 202
+    limited = client.post("/public/jobs", json={"url": SPACE_URL}, headers=headers)
+    assert limited.status_code == 429
+    assert limited.json() == {"detail": "RATE_LIMITED"}
+    assert int(limited.headers["retry-after"]) > 0
+    other = client.post(
+        "/public/jobs",
+        json={"url": SPACE_URL},
+        headers={"X-Forwarded-For": "198.51.100.12"},
+    )
+    assert other.status_code == 202
+
+
+def test_public_client_ip_uses_render_first_forwarded_address(
+    client: TestClient,
+) -> None:
+    request = client.build_request(
+        "POST",
+        "/public/jobs",
+        headers={"X-Forwarded-For": "198.51.100.15, 10.0.0.2"},
+    )
+    assert bridge.public_client_ip(request) == "198.51.100.15"
+
+
+def test_busy_public_submission_does_not_consume_rate_limit(
+    client: TestClient,
+) -> None:
+    headers = {"X-Forwarded-For": "198.51.100.13"}
+    with bridge.manager.lock:
+        bridge.manager.active_job_id = "active"
+    for _ in range(3):
+        response = client.post(
+            "/public/jobs",
+            json={"url": SPACE_URL},
+            headers=headers,
+        )
+        assert response.status_code == 429
+        assert response.json() == {"detail": "BUSY"}
+
+
+def test_public_routes_only_expose_public_jobs(client: TestClient) -> None:
+    now = time.time()
+    with bridge.manager.lock:
+        bridge.manager.jobs["public"] = {
+            "job_id": "public",
+            "status": "completed",
+            "stage": "completed",
+            "visibility": "public",
+            "created_at": now,
+            "finished_at": now,
+            "result": {"segments": []},
+        }
+        bridge.manager.jobs["private"] = {
+            "job_id": "private",
+            "status": "completed",
+            "stage": "completed",
+            "visibility": "authenticated",
+            "created_at": now,
+            "finished_at": now,
+            "result": {"segments": []},
+        }
+    assert client.get("/public/jobs/public").status_code == 200
+    assert client.get("/public/jobs/public/result").status_code == 200
+    assert client.get("/public/jobs/private").status_code == 404
+    assert client.get("/public/jobs/private/result").status_code == 404
 
 
 def test_api_job_status_has_null_progress(client: TestClient) -> None:
@@ -372,6 +509,57 @@ def test_oversized_media_never_calls_groq(
     assert job["error_code"] == "GROQ_FILE_TOO_LARGE"
     assert job["cleanup"] is True
     assert called is False
+
+
+def test_public_duration_limit_never_calls_groq_and_cleans_up(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_download(
+        url: str,
+        destination: Path,
+    ) -> tuple[Path, dict[str, object]]:
+        source = destination / "source.m4a"
+        source.write_bytes(b"source")
+        return source, {}
+
+    def fake_remux(source: Path, destination: Path) -> Path:
+        destination.write_bytes(b"m4a")
+        return destination
+
+    called = False
+
+    def forbidden_groq(path: Path, key: str) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(bridge, "PUBLIC_MAX_AUDIO_SECONDS", 60)
+    monkeypatch.setattr(bridge, "download_space", fake_download)
+    monkeypatch.setattr(bridge, "remux_to_m4a", fake_remux)
+    monkeypatch.setattr(
+        bridge,
+        "probe_m4a",
+        lambda path: media.MediaInfo(61.0, 3, "aac", "mov,mp4,m4a"),
+    )
+    monkeypatch.setattr(bridge, "transcribe_m4a", forbidden_groq)
+
+    response = client.post(
+        "/public/jobs",
+        json={"url": SPACE_URL},
+        headers={"X-Forwarded-For": "198.51.100.14"},
+    )
+    job_id = response.json()["job_id"]
+    for _ in range(200):
+        job = client.get(f"/public/jobs/{job_id}").json()
+        if job["status"] == "failed":
+            break
+        time.sleep(0.01)
+    result = client.get(f"/public/jobs/{job_id}/result").json()
+    assert job["error_code"] == "AUDIO_TOO_LONG"
+    assert result["error_code"] == "AUDIO_TOO_LONG"
+    assert called is False
+    assert not (bridge.WORK_ROOT / job_id).exists()
 
 
 def test_processing_result_does_not_expose_transcript(client: TestClient) -> None:
