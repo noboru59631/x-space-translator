@@ -21,13 +21,17 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.services.downloader import download_space, normalize_x_url
 from app.services.errors import AppError, DownloadError
 from render_bridge_app.errors import BridgeError
 from render_bridge_app.groq_client import transcribe_m4a
 from render_bridge_app.media import dependencies_available, probe_m4a, remux_to_m4a
+from render_bridge_app.translation_jobs import (
+    TranslationBusyError,
+    TranslationJobManager,
+)
 
 LOGGER = logging.getLogger(__name__)
 WORK_ROOT = Path(
@@ -35,6 +39,10 @@ WORK_ROOT = Path(
 )
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 MAX_JSON_BODY_BYTES = 8192
+MAX_TRANSLATION_JSON_BODY_BYTES = max(
+    65536,
+    int(os.getenv("MAX_TRANSLATION_JSON_BODY_BYTES", "1048576")),
+)
 JOB_TTL_SECONDS = max(
     600,
     int(os.getenv("JOB_TTL_SECONDS", os.getenv("RESULT_TTL_SECONDS", "1800"))),
@@ -48,6 +56,30 @@ PUBLIC_RATE_LIMIT_WINDOW_SECONDS = max(
 PUBLIC_MAX_AUDIO_SECONDS = max(
     60,
     int(os.getenv("PUBLIC_MAX_AUDIO_SECONDS", "7200")),
+)
+PUBLIC_TRANSLATION_RATE_LIMIT_JOBS = max(
+    1,
+    int(os.getenv("PUBLIC_TRANSLATION_RATE_LIMIT_JOBS", "2")),
+)
+PUBLIC_TRANSLATION_RATE_LIMIT_WINDOW_SECONDS = max(
+    60,
+    int(os.getenv("PUBLIC_TRANSLATION_RATE_LIMIT_WINDOW_SECONDS", "600")),
+)
+PUBLIC_TRANSLATION_MAX_SEGMENTS = max(
+    1,
+    int(os.getenv("PUBLIC_TRANSLATION_MAX_SEGMENTS", "500")),
+)
+PUBLIC_TRANSLATION_MAX_CHARACTERS = max(
+    1000,
+    int(os.getenv("PUBLIC_TRANSLATION_MAX_CHARACTERS", "120000")),
+)
+PUBLIC_TRANSLATION_BATCH_SEGMENTS = max(
+    1,
+    int(os.getenv("PUBLIC_TRANSLATION_BATCH_SEGMENTS", "30")),
+)
+PUBLIC_TRANSLATION_BATCH_CHARACTERS = max(
+    1000,
+    int(os.getenv("PUBLIC_TRANSLATION_BATCH_CHARACTERS", "6000")),
 )
 
 
@@ -112,6 +144,37 @@ class TranscribeRequest(BaseModel):
             return normalize_x_url(value)
         except AppError as exc:
             raise ValueError(str(exc)) from exc
+
+
+class TranslationSegment(BaseModel):
+    speaker: str = Field(default="Speaker", min_length=1, max_length=100)
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    original: str = Field(min_length=1, max_length=10000)
+
+    @model_validator(mode="after")
+    def validate_timestamps(self) -> TranslationSegment:
+        if self.end < self.start:
+            raise ValueError("end must be greater than or equal to start")
+        self.original = self.original.strip()
+        if not self.original:
+            raise ValueError("original must not be blank")
+        return self
+
+
+class TranslationRequest(BaseModel):
+    segments: list[TranslationSegment] = Field(
+        min_length=1,
+        max_length=PUBLIC_TRANSLATION_MAX_SEGMENTS,
+    )
+
+    @model_validator(mode="after")
+    def validate_total_characters(self) -> TranslationRequest:
+        if sum(len(segment.original) for segment in self.segments) > (
+            PUBLIC_TRANSLATION_MAX_CHARACTERS
+        ):
+            raise ValueError("Transcript exceeds the public translation character limit")
+        return self
 
 
 def groq_upload_limit_bytes() -> int:
@@ -460,6 +523,16 @@ public_rate_limiter = IpRateLimiter(
     PUBLIC_RATE_LIMIT_JOBS,
     PUBLIC_RATE_LIMIT_WINDOW_SECONDS,
 )
+public_translation_rate_limiter = IpRateLimiter(
+    PUBLIC_TRANSLATION_RATE_LIMIT_JOBS,
+    PUBLIC_TRANSLATION_RATE_LIMIT_WINDOW_SECONDS,
+)
+translation_manager = TranslationJobManager(
+    ttl_seconds=JOB_TTL_SECONDS,
+    batch_segments=PUBLIC_TRANSLATION_BATCH_SEGMENTS,
+    batch_characters=PUBLIC_TRANSLATION_BATCH_CHARACTERS,
+)
+operation_submission_lock = threading.Lock()
 app = FastAPI(title="X Space Translator Render Bridge PoC", version="0.1.0-poc")
 
 
@@ -468,9 +541,19 @@ async def validation_exception_handler(
     request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
-    if request.url.path in {"/api/jobs", "/public/jobs"}:
+    if request.url.path in {
+        "/api/jobs",
+        "/public/jobs",
+        "/public/translations",
+    }:
         return JSONResponse(
-            {"error_code": "INVALID_URL"},
+            {
+                "error_code": (
+                    "INVALID_TRANSLATION_REQUEST"
+                    if request.url.path == "/public/translations"
+                    else "INVALID_URL"
+                )
+            },
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
     return await request_validation_exception_handler(request, exc)
@@ -478,23 +561,30 @@ async def validation_exception_handler(
 
 @app.middleware("http")
 async def limit_json_body(request: Request, call_next):  # type: ignore[no-untyped-def]
-    if request.method == "POST" and request.url.path in {
+    limited_paths = {
         "/jobs",
         "/transcribe",
         "/api/jobs",
         "/public/jobs",
-    }:
+        "/public/translations",
+    }
+    if request.method == "POST" and request.url.path in limited_paths:
+        body_limit = (
+            MAX_TRANSLATION_JSON_BODY_BYTES
+            if request.url.path == "/public/translations"
+            else MAX_JSON_BODY_BYTES
+        )
         content_length = request.headers.get("content-length")
         try:
             declared_length = int(content_length) if content_length else 0
         except ValueError:
             return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
-        if declared_length > MAX_JSON_BODY_BYTES:
+        if declared_length > body_limit:
             return JSONResponse(
                 {"detail": "Request body too large"},
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
-        if len(await request.body()) > MAX_JSON_BODY_BYTES:
+        if len(await request.body()) > body_limit:
             return JSONResponse(
                 {"detail": "Request body too large"},
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -532,7 +622,10 @@ def submit_job(
             "GROQ_API_KEY is not configured",
         )
     try:
-        return manager.submit(payload.url, visibility=visibility)
+        with operation_submission_lock:
+            if translation_manager.is_busy():
+                raise BusyError("Bridge is already processing another job")
+            return manager.submit(payload.url, visibility=visibility)
     except BusyError as exc:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
@@ -618,6 +711,44 @@ def create_public_job(
     return {"job_id": job["job_id"], "status": job["status"]}
 
 
+@app.post("/public/translations", status_code=status.HTTP_202_ACCEPTED)
+def create_public_translation(
+    payload: TranslationRequest,
+    request: Request,
+) -> dict[str, object]:
+    if not os.getenv("GROQ_API_KEY"):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "GROQ_API_KEY is not configured",
+        )
+    client_ip = public_client_ip(request)
+    try:
+        rate_event = public_translation_rate_limiter.consume(client_ip)
+    except RateLimitError as exc:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    try:
+        with operation_submission_lock:
+            if manager.is_busy():
+                raise TranslationBusyError("Bridge is already processing another job")
+            job = translation_manager.submit(
+                [segment.model_dump() for segment in payload.segments]
+            )
+    except TranslationBusyError as exc:
+        public_translation_rate_limiter.refund(client_ip, rate_event)
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "BUSY",
+        ) from exc
+    except Exception:
+        public_translation_rate_limiter.refund(client_ip, rate_event)
+        raise
+    return {"job_id": job["job_id"], "status": job["status"]}
+
+
 def find_job(job_id: str) -> dict[str, object]:
     job = manager.get(job_id)
     if not job:
@@ -628,6 +759,13 @@ def find_job(job_id: str) -> dict[str, object]:
 def find_public_job(job_id: str) -> dict[str, object]:
     job = find_job(job_id)
     if job.get("visibility") != "public":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
+    return job
+
+
+def find_translation_job(job_id: str) -> dict[str, object]:
+    job = translation_manager.get(job_id)
+    if not job:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
     return job
 
@@ -672,3 +810,15 @@ def get_public_job(job_id: str) -> dict[str, object]:
 @app.get("/public/jobs/{job_id}/result")
 def get_public_result(job_id: str) -> dict[str, object]:
     return manager.api_result_view(find_public_job(job_id))
+
+
+@app.get("/public/translations/{translation_job_id}")
+def get_public_translation(translation_job_id: str) -> dict[str, object]:
+    return translation_manager.status_view(find_translation_job(translation_job_id))
+
+
+@app.get("/public/translations/{translation_job_id}/result")
+def get_public_translation_result(
+    translation_job_id: str,
+) -> dict[str, object]:
+    return translation_manager.result_view(find_translation_job(translation_job_id))
