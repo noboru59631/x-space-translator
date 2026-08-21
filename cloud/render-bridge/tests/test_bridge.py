@@ -32,6 +32,10 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
         bridge.manager.jobs.clear()
         bridge.manager.active_job_id = None
     bridge.public_rate_limiter.clear()
+    with bridge.translation_manager.lock:
+        bridge.translation_manager.jobs.clear()
+        bridge.translation_manager.active_job_id = None
+    bridge.public_translation_rate_limiter.clear()
     return TestClient(app)
 
 

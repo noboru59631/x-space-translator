@@ -42,6 +42,42 @@ duration is longer. These controls are configurable with
 `PUBLIC_RATE_LIMIT_JOBS`, `PUBLIC_RATE_LIMIT_WINDOW_SECONDS`, and
 `PUBLIC_MAX_AUDIO_SECONDS`.
 
+### Public Japanese translation jobs
+
+Bankr can translate an existing Viewer transcript without receiving the Groq
+secret:
+
+- `POST /public/translations`
+- `GET /public/translations/{translation_job_id}`
+- `GET /public/translations/{translation_job_id}/result`
+
+The POST body contains Viewer-compatible `segments` with `speaker`, `start`,
+`end`, and `original`. It returns HTTP 202 immediately. Translation runs in a
+single background worker with Groq `openai/gpt-oss-120b`, strict structured
+JSON, a conservative 4,096-token completion cap, and bounded batches. The
+result preserves those fields and adds
+`translation` and `translation_warning`.
+
+Groq HTTP 429 responses are retried with the provider's reset guidance (or a
+bounded backoff) because a full transcript can span multiple model requests.
+This transport retry is separate from the one preservation-correction retry.
+If structured output ever omits or misaligns batch IDs, that batch is split and
+retried in smaller halves until alignment is exact or a single segment fails.
+
+Numbers, URLs, BTC, ETH, SOL, XRP, USDT, and USDC are compared between each
+original and translation. A mismatched segment is translated one more time;
+only a mismatch that remains after that retry sets `translation_warning`.
+Equivalent full-width digits and common English/Japanese scale forms such as
+`1 million` and `100万` are normalized to reduce false warnings.
+
+Translation jobs have a separate per-IP allowance of two accepted jobs per 10
+minutes. Requests are limited to 500 segments, 120,000 original characters,
+and a 1 MiB JSON body by default. Transcription and translation submissions
+share a service-wide admission check so only one heavy operation is accepted
+at a time. Job IDs are random UUIDs and results expire from memory after the
+same `JOB_TTL_SECONDS` interval. No transcript or translation is written to a
+database or temporary file, and neither text is logged.
+
 The following endpoints require
 `Authorization: Bearer <BRIDGE_API_KEY>`:
 

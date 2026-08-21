@@ -23,3 +23,23 @@ services:
         value: "600"
       - key: PUBLIC_MAX_AUDIO_SECONDS
         value: "7200"
+      - key: GROQ_TRANSLATION_MODEL
+        value: openai/gpt-oss-120b
+      - key: GROQ_TRANSLATION_MAX_COMPLETION_TOKENS
+        value: "4096"
+      - key: GROQ_TRANSLATION_HTTP_RETRIES
+        value: "4"
+      - key: MAX_TRANSLATION_JSON_BODY_BYTES
+        value: "1048576"
+      - key: PUBLIC_TRANSLATION_RATE_LIMIT_JOBS
+        value: "2"
+      - key: PUBLIC_TRANSLATION_RATE_LIMIT_WINDOW_SECONDS
+        value: "600"
+      - key: PUBLIC_TRANSLATION_MAX_SEGMENTS
+        value: "500"
+      - key: PUBLIC_TRANSLATION_MAX_CHARACTERS
+        value: "120000"
+      - key: PUBLIC_TRANSLATION_BATCH_SEGMENTS
+        value: "30"
+      - key: PUBLIC_TRANSLATION_BATCH_CHARACTERS
+        value: "6000"
