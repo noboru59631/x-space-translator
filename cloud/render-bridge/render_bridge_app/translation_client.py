@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import time
 
 import httpx
 
 from render_bridge_app.errors import BridgeError
+from render_bridge_app.translation_rate_limit import (
+    RateLimitSnapshot,
+    TranslationRateLimitScheduler,
+    completion_token_limit,
+    estimate_request_token_ceiling,
+)
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_TRANSLATION_MODEL = "openai/gpt-oss-120b"
@@ -22,7 +26,7 @@ def translation_model() -> str:
     return os.getenv("GROQ_TRANSLATION_MODEL", DEFAULT_TRANSLATION_MODEL)
 
 
-def max_completion_tokens() -> int:
+def configured_max_completion_tokens() -> int:
     return max(
         512,
         min(
@@ -37,6 +41,13 @@ def max_completion_tokens() -> int:
     )
 
 
+def max_completion_tokens(items: list[dict[str, object]] | None = None) -> int:
+    configured = configured_max_completion_tokens()
+    if items is None:
+        return configured
+    return completion_token_limit(items, configured)
+
+
 def http_retries() -> int:
     return max(
         0,
@@ -48,11 +59,11 @@ def http_retries() -> int:
 
 
 def rate_limit_delay(response: httpx.Response, attempt: int) -> float:
-    for header_name in ("retry-after", "x-ratelimit-reset-tokens"):
-        raw_value = response.headers.get(header_name, "")
-        match = re.search(r"\d+(?:\.\d+)?", raw_value)
-        if match:
-            return max(1.0, min(60.0, float(match.group(0))))
+    snapshot = RateLimitSnapshot.from_headers(getattr(response, "headers", {}))
+    if snapshot.retry_after_seconds is not None:
+        return max(1.0, min(60.0, snapshot.retry_after_seconds))
+    if snapshot.reset_tokens_seconds is not None:
+        return max(1.0, min(60.0, snapshot.reset_tokens_seconds))
     return min(30.0, float(2 ** (attempt + 1)))
 
 
@@ -61,8 +72,16 @@ def translate_batch(
     api_key: str,
     *,
     retry: bool = False,
+    scheduler: TranslationRateLimitScheduler | None = None,
 ) -> dict[int, str]:
     """Translate an indexed batch and reject any alignment drift."""
+    active_scheduler = scheduler or TranslationRateLimitScheduler()
+    active_scheduler.record_batch(items)
+    completion_limit = max_completion_tokens(items)
+    request_token_ceiling = estimate_request_token_ceiling(
+        items,
+        completion_limit,
+    )
     expected_ids = [int(item["id"]) for item in items]
     schema = {
         "type": "object",
@@ -117,20 +136,34 @@ def translate_batch(
                 "schema": schema,
             },
         },
-        "max_completion_tokens": max_completion_tokens(),
+        "max_completion_tokens": completion_limit,
         "store": False,
     }
     try:
-        with httpx.Client(timeout=httpx.Timeout(180, connect=30)) as client:
+        request_timeout = active_scheduler.http_timeout_seconds()
+        with httpx.Client(
+            timeout=httpx.Timeout(request_timeout, connect=min(30, request_timeout)),
+        ) as client:
             for attempt in range(http_retries() + 1):
+                active_scheduler.before_request(request_token_ceiling)
+                active_scheduler.request_started()
                 response = client.post(
                     GROQ_CHAT_URL,
                     headers={"Authorization": f"Bearer {api_key}"},
                     json=request_payload,
                 )
+                active_scheduler.observe_response(
+                    response,
+                    estimated_tokens=request_token_ceiling,
+                )
                 if response.status_code != 429 or attempt >= http_retries():
                     break
-                time.sleep(rate_limit_delay(response, attempt))
+                if active_scheduler.daily_request_limit_reached():
+                    raise BridgeError(
+                        "GROQ_TRANSLATION_DAILY_LIMIT",
+                        "Groq daily request limit was reached",
+                    )
+                active_scheduler.wait_for_retry(attempt)
     except httpx.HTTPError as exc:
         raise BridgeError(
             "GROQ_TRANSLATION_NETWORK_ERROR",
@@ -139,6 +172,12 @@ def translate_batch(
     if response.status_code in {401, 403}:
         raise BridgeError("GROQ_TRANSLATION_AUTH", "Groq rejected the API key")
     if response.status_code == 429:
+        active_scheduler.mark_final_429_failure()
+        if active_scheduler.daily_request_limit_reached():
+            raise BridgeError(
+                "GROQ_TRANSLATION_DAILY_LIMIT",
+                "Groq daily request limit was reached",
+            )
         raise BridgeError(
             "GROQ_TRANSLATION_RATE_LIMIT",
             "Groq translation rate limit was reached",

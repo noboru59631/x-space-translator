@@ -75,11 +75,19 @@ PUBLIC_TRANSLATION_MAX_CHARACTERS = max(
 )
 PUBLIC_TRANSLATION_BATCH_SEGMENTS = max(
     1,
-    int(os.getenv("PUBLIC_TRANSLATION_BATCH_SEGMENTS", "30")),
+    int(os.getenv("PUBLIC_TRANSLATION_BATCH_SEGMENTS", "10")),
 )
 PUBLIC_TRANSLATION_BATCH_CHARACTERS = max(
     1000,
-    int(os.getenv("PUBLIC_TRANSLATION_BATCH_CHARACTERS", "6000")),
+    int(os.getenv("PUBLIC_TRANSLATION_BATCH_CHARACTERS", "2000")),
+)
+PUBLIC_TRANSLATION_BATCH_TOKENS = max(
+    1000,
+    min(1500, int(os.getenv("PUBLIC_TRANSLATION_BATCH_TOKENS", "1250"))),
+)
+TRANSLATION_JOB_TIMEOUT_SECONDS = max(
+    60,
+    int(os.getenv("TRANSLATION_JOB_TIMEOUT_SECONDS", "600")),
 )
 
 
@@ -175,6 +183,11 @@ class TranslationRequest(BaseModel):
         ):
             raise ValueError("Transcript exceeds the public translation character limit")
         return self
+
+
+class JobTranslationRequest(BaseModel):
+    start_index: int = Field(default=0, ge=0)
+    count: int = Field(default=20, ge=1, le=25)
 
 
 def groq_upload_limit_bytes() -> int:
@@ -305,6 +318,8 @@ class JobManager:
             "peak_memory_mb": None,
             "cleanup": False,
             "result": None,
+            "translation_job_id": None,
+            "translation_jobs": {},
             "finished_at": None,
         }
         with self.lock:
@@ -329,6 +344,27 @@ class JobManager:
         with self.lock:
             if self.active_job_id == job_id:
                 self.active_job_id = None
+
+    def link_translation_job(
+        self,
+        transcript_job_id: str,
+        translation_job_id: str,
+        *,
+        range_key: str = "0:20",
+        legacy_default: bool = False,
+    ) -> None:
+        """Associate one range translation with its in-memory transcript."""
+        with self.lock:
+            job = self.jobs.get(transcript_job_id)
+            if job is None:
+                raise KeyError(transcript_job_id)
+            linked = job.get("translation_jobs")
+            if not isinstance(linked, dict):
+                linked = {}
+                job["translation_jobs"] = linked
+            linked[range_key] = translation_job_id
+            if legacy_default:
+                job["translation_job_id"] = translation_job_id
 
     def _run(self, job_id: str, source_url: str, visibility: str) -> None:
         job_dir = WORK_ROOT / job_id
@@ -531,6 +567,7 @@ translation_manager = TranslationJobManager(
     ttl_seconds=JOB_TTL_SECONDS,
     batch_segments=PUBLIC_TRANSLATION_BATCH_SEGMENTS,
     batch_characters=PUBLIC_TRANSLATION_BATCH_CHARACTERS,
+    batch_token_target=PUBLIC_TRANSLATION_BATCH_TOKENS,
 )
 operation_submission_lock = threading.Lock()
 app = FastAPI(title="X Space Translator Render Bridge PoC", version="0.1.0-poc")
@@ -568,7 +605,14 @@ async def limit_json_body(request: Request, call_next):  # type: ignore[no-untyp
         "/public/jobs",
         "/public/translations",
     }
-    if request.method == "POST" and request.url.path in limited_paths:
+    job_id_translation_path = (
+        request.url.path.startswith("/public/jobs/")
+        and request.url.path.endswith("/translations")
+        and request.url.path.count("/") == 4
+    )
+    if request.method == "POST" and (
+        request.url.path in limited_paths or job_id_translation_path
+    ):
         body_limit = (
             MAX_TRANSLATION_JSON_BODY_BYTES
             if request.url.path == "/public/translations"
@@ -747,6 +791,148 @@ def create_public_translation(
         public_translation_rate_limiter.refund(client_ip, rate_event)
         raise
     return {"job_id": job["job_id"], "status": job["status"]}
+
+
+@app.post(
+    "/public/jobs/{transcript_job_id}/translations",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_public_job_translation(
+    transcript_job_id: str,
+    request: Request,
+    payload: JobTranslationRequest | None = None,
+) -> dict[str, object]:
+    """Translate one explicit transcript range without resending its text."""
+    if not os.getenv("GROQ_API_KEY"):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "GROQ_API_KEY is not configured",
+        )
+
+    with operation_submission_lock:
+        transcript_job = manager.get(transcript_job_id)
+        if not transcript_job or transcript_job.get("visibility") != "public":
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "TRANSCRIPT_JOB_NOT_FOUND",
+            )
+        if transcript_job.get("status") != "completed":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "TRANSCRIPT_NOT_READY",
+            )
+
+        result = transcript_job.get("result")
+        segments = result.get("segments") if isinstance(result, dict) else None
+        if not isinstance(segments, list) or not segments:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "TRANSCRIPT_EMPTY",
+            )
+
+        range_request = payload or JobTranslationRequest()
+        total_segments = len(segments)
+        if range_request.start_index >= total_segments:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "INVALID_START_INDEX",
+            )
+        end_index = min(
+            total_segments,
+            range_request.start_index + range_request.count,
+        )
+        range_key = f"{range_request.start_index}:{end_index}"
+        is_default_range = (
+            range_request.start_index == 0 and range_request.count == 20
+        )
+        selected_segments = [
+            {
+                **segment,
+                "index": index,
+            }
+            for index, segment in enumerate(
+                segments[range_request.start_index:end_index],
+                start=range_request.start_index,
+            )
+            if isinstance(segment, dict)
+        ]
+        if not selected_segments:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "TRANSCRIPT_EMPTY",
+            )
+
+        linked_jobs = transcript_job.get("translation_jobs")
+        existing_job_id = (
+            linked_jobs.get(range_key)
+            if isinstance(linked_jobs, dict)
+            else None
+        )
+        if not existing_job_id and is_default_range:
+            existing_job_id = transcript_job.get("translation_job_id")
+        if isinstance(existing_job_id, str) and existing_job_id:
+            existing_job = translation_manager.get(existing_job_id)
+            if existing_job and existing_job.get("status") in {
+                "queued",
+                "processing",
+                "completed",
+            }:
+                return {
+                    "job_id": existing_job["job_id"],
+                    "status": existing_job["status"],
+                }
+            if existing_job:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "TRANSLATION_ALREADY_EXISTS",
+                )
+
+        client_ip = public_client_ip(request)
+        try:
+            rate_event = public_translation_rate_limiter.consume(client_ip)
+        except RateLimitError as exc:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                headers={"Retry-After": str(exc.retry_after)},
+            ) from exc
+
+        try:
+            if manager.is_busy():
+                raise TranslationBusyError("Bridge is already processing another job")
+            translation_job = translation_manager.submit(
+                selected_segments,
+                result_context={
+                    "start_index": range_request.start_index,
+                    "count": len(selected_segments),
+                    "total_segments": total_segments,
+                    "has_more": end_index < total_segments,
+                    "next_index": (
+                        end_index if end_index < total_segments else None
+                    ),
+                },
+                timeout_seconds=TRANSLATION_JOB_TIMEOUT_SECONDS,
+            )
+            manager.link_translation_job(
+                transcript_job_id,
+                str(translation_job["job_id"]),
+                range_key=range_key,
+                legacy_default=is_default_range,
+            )
+        except TranslationBusyError as exc:
+            public_translation_rate_limiter.refund(client_ip, rate_event)
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "BUSY",
+            ) from exc
+        except Exception:
+            public_translation_rate_limiter.refund(client_ip, rate_event)
+            raise
+
+    return {
+        "job_id": translation_job["job_id"],
+        "status": translation_job["status"],
+    }
 
 
 def find_job(job_id: str) -> dict[str, object]:

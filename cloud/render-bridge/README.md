@@ -54,13 +54,18 @@ secret:
 The POST body contains Viewer-compatible `segments` with `speaker`, `start`,
 `end`, and `original`. It returns HTTP 202 immediately. Translation runs in a
 single background worker with Groq `openai/gpt-oss-120b`, strict structured
-JSON, a conservative 4,096-token completion cap, and bounded batches. The
+JSON, a translation-sized dynamic completion cap, and bounded batches. The
 result preserves those fields and adds
 `translation` and `translation_warning`.
 
-Groq HTTP 429 responses are retried with the provider's reset guidance (or a
-bounded backoff) because a full transcript can span multiple model requests.
-This transport retry is separate from the one preservation-correction retry.
+Free Plan batches are limited to 10 segments and 2,000 source characters. A
+token-aware scheduler retains only numeric rate-limit header values, uses the
+reported remaining TPM and reset duration before sending the next batch, and
+keeps a conservative local 60-second token window. If those headers are
+missing, requests are spaced by 20 seconds. Groq HTTP 429 responses use
+`retry-after`, then the token reset duration, then bounded exponential backoff.
+The retry count remains finite. This transport retry is separate from the one
+preservation-correction retry.
 If structured output ever omits or misaligns batch IDs, that batch is split and
 retried in smaller halves until alignment is exact or a single segment fails.
 
@@ -77,6 +82,60 @@ share a service-wide admission check so only one heavy operation is accepted
 at a time. Job IDs are random UUIDs and results expire from memory after the
 same `JOB_TTL_SECONDS` interval. No transcript or translation is written to a
 database or temporary file, and neither text is logged.
+
+When transcription was created through `POST /public/jobs`, the completed
+in-memory transcript can also be translated without sending its segments back:
+
+- `POST /public/jobs/{transcript_job_id}/translations`
+
+The optional request body selects a range and defaults to the first 20
+segments:
+
+```json
+{"start_index": 0, "count": 20}
+```
+
+`count` must be between 1 and 25. Only that slice is submitted to the existing
+translation worker; the bridge never advances automatically to the next
+range. Each translated segment includes its original zero-based `index`.
+The result also contains `start_index`, the actual returned `count`,
+`total_segments`, `has_more`, and `next_index`. A final partial range returns
+`has_more: false` and `next_index: null`.
+
+The response contains the translation `job_id`, which is polled through the
+existing `GET /public/translations/{job_id}` and
+`GET /public/translations/{job_id}/result` endpoints. Repeated requests reuse
+the existing queued, processing, or completed translation job for the same
+range instead of starting another Groq request. A different range can be
+started only after the active translation has finished and requires a new
+explicit user action.
+
+This Job-ID translation route works only while the completed Transcript Job is
+still within its 30-minute TTL and remains in the same running Render process.
+Render restarts, redeploys, and TTL expiry remove the in-memory transcript, so
+the route then returns `TRANSCRIPT_JOB_NOT_FOUND`. No database or Redis storage
+is used.
+
+Translation requests use a strict rolling 60-second token budget for Groq's
+Free Plan. The provider limit is treated as 8,000 TPM, while the bridge uses at
+most 6,000 estimated or measured tokens and keeps 2,000 tokens in reserve.
+Batches remain capped at 10 segments and 2,000 characters, and are reduced
+further to target about 1,250 total input/output tokens per request. Successful
+usage values replace estimates in the rolling window. When available, Groq's
+remaining-token and reset headers take priority; otherwise the bridge applies
+conservative fixed pacing. Translation must be polled as an asynchronous job.
+Full-transcript automatic translation is intentionally not performed by the
+Job-ID route on the Free Plan.
+
+Provider-directed waits are split into at most
+`TRANSLATION_MAX_SINGLE_WAIT_SECONDS` (60 seconds by default), so a long reset
+header cannot leave a job in one opaque sleep. Range jobs have a
+`TRANSLATION_JOB_TIMEOUT_SECONDS` deadline (600 seconds by default). While a
+job is running, its status response exposes only safe operational telemetry,
+including batch progress, request counts, wait reason, bounded wait duration,
+and heartbeat timestamps. A timed-out job becomes `failed` with
+`TRANSLATION_TIMEOUT`; transcript and translation text are not included in
+telemetry.
 
 The following endpoints require
 `Authorization: Bearer <BRIDGE_API_KEY>`:

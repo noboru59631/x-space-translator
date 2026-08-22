@@ -40,6 +40,20 @@ services:
       - key: PUBLIC_TRANSLATION_MAX_CHARACTERS
         value: "120000"
       - key: PUBLIC_TRANSLATION_BATCH_SEGMENTS
-        value: "30"
+        value: "10"
       - key: PUBLIC_TRANSLATION_BATCH_CHARACTERS
+        value: "2000"
+      - key: PUBLIC_TRANSLATION_BATCH_TOKENS
+        value: "1250"
+      - key: GROQ_TRANSLATION_TPM_LIMIT
+        value: "8000"
+      - key: GROQ_TRANSLATION_TOKEN_BUDGET
         value: "6000"
+      - key: GROQ_TRANSLATION_TOKEN_RESERVE
+        value: "2000"
+      - key: GROQ_TRANSLATION_FALLBACK_INTERVAL_SECONDS
+        value: "20"
+      - key: TRANSLATION_MAX_SINGLE_WAIT_SECONDS
+        value: "60"
+      - key: TRANSLATION_JOB_TIMEOUT_SECONDS
+        value: "600"
